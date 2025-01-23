@@ -2,6 +2,8 @@ import argparse
 import json
 import requests
 
+from datetime import date, datetime, timedelta
+
 class BIMcloud():
 
 	def __init__(self, manager: str, client: str, user: str, password: str):
@@ -13,10 +15,10 @@ class BIMcloud():
 		self.auth_header = None
 		self.session = None
 
-		self.authorize()
-		self.grant()
+		self._authorize()
+		self._grant()
 
-	def authorize(self):
+	def _authorize(self):
 		url = self.manager + '/management/client/oauth2/token'
 		request = {
 			'grant_type': 'password',
@@ -33,7 +35,7 @@ class BIMcloud():
 		except:
 			raise
 
-	def grant(self):
+	def _grant(self):
 		try:
 			servers = self.get_model_servers()
 			ticket = self.get_ticket(servers[0]['id'])
@@ -77,9 +79,19 @@ class BIMcloud():
 		result = response.json()
 		return result['data']
 
+	def get_blob_content(self, session_id, blob_id):
+		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/get-blob-content'
+		response = requests.get(url, params={'session-id': session_id, 'blob-id': blob_id}, stream=True)
+		return response
+
 	def get_model_servers(self):
 		url = self.manager + '/management/client/get-model-servers'
 		response = requests.get(url, headers=self.auth_header)
+		return response.json()
+
+	def get_resources(self, criterion={}):
+		url = self.manager + '/management/client/get-resources-by-criterion'
+		response = requests.post(url, headers=self.auth_header, params={}, json={**criterion})
 		return response.json()
 
 	def get_ticket(self, server_id):
@@ -106,6 +118,47 @@ class BackupManager():
 
 	def __init__(self, client):
 		self.client = client
+
+	def start(self):
+		log = bm.get_backup_log()
+		if log:
+			blob = self.client.get_blob_content(self.client.session['id'], log['id'])
+			modified = self.get_modified(log['$modifiedDate'])
+		if blob and modified:
+			name = f"job_backup_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+			data = blob.json()
+			for m in modified:
+				print (f"{m['id']} {m['name']}")
+				data[name] = len(modified)
+
+				write = self.write_data(data, '/_LOG/job_backup.json')
+
+	def get_backup_log(self):
+		blobs = self.client.get_resources(
+			criterion = {
+				'$and': [
+					{'$eq': {'type': 'blob'}},
+					{'$eq': {'$parentName': '_LOG'}}
+				]
+			}
+		)
+		if blobs:
+			return blobs[0]
+		return None
+
+	def get_modified(self, from_time=0):
+		resources = self.client.get_resources(
+			criterion = {
+				'$and': [
+					{'$gte': {'$modifiedDate': from_time }},
+					{'$or': [
+						{'$eq': {'type': 'project'}},
+						{'$eq': {'type': 'library'}}
+					]}
+				]
+			}
+		)
+		return resources
 
 	def write_data(self, data, path):
 		# convert data
@@ -142,7 +195,50 @@ if __name__ == "__main__":
 		bc = BIMcloud(**vars(arg))
 		bm = BackupManager(bc)
 
-		bm.write_data({"qwerty": 123}, '/_BCP/backup.json')
+		bm.start()
+
+		# data = {
+		#     "job_2025-01-23_01:47:17": [
+		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
+		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
+		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4",
+		#         "6C1C2047-14E4-4EFB-97A8-EB225A780F31",
+		#         "BF17CC81-A0E8-4D64-9456-7E37BD2896F2",
+		#         "A8A1DA3E-84E2-4E60-B3E3-412A56AE65BD",
+		#         "39FBBB2A-A5D2-4446-83BB-619E950320EA"
+		#     ],
+		#     "job_2025-02-25_01:47:17": [
+		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
+		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
+		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4"
+		#     ]
+		# }
+		# data = [
+		#     {"job_2025-01-23_01:47:17": [
+		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
+		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
+		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4",
+		#         "6C1C2047-14E4-4EFB-97A8-EB225A780F31",
+		#         "BF17CC81-A0E8-4D64-9456-7E37BD2896F2",
+		#         "A8A1DA3E-84E2-4E60-B3E3-412A56AE65BD",
+		#         "39FBBB2A-A5D2-4446-83BB-619E950320EA"
+		#     ]},
+		#     {"job_2025-02-25_01:47:17": [
+		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
+		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
+		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4"
+		#     ]}
+		# ]
+
+		# bm.write_data(data, '/_LOG/job_backup.json')
+		# job = bm.get_last_job()
+		# job_date = datetime.strptime(job['job_updated'], '%Y-%m-%d %H:%M:%S')
+		# job_time = int(job_date.timestamp())
+
+		# res = bm.get_modified(from_time=job_time)
+		# print(json.dumps(res, indent = 4))
+		# for r in res:
+		# 	print (r['name'])
 
 	except:
 		raise
