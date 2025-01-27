@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 
 class BIMcloud():
 
-	def __init__(self, manager: str, client: str, user: str, password: str):
+	def __init__(self, manager: str, client: str, user: str, password: str, **params):
 		self.manager = manager
 		self.client = client
 		self.user = user
@@ -79,10 +79,20 @@ class BIMcloud():
 		result = response.json()
 		return result['data']
 
+	def delete_resource_backup(self, resource_id, backup_id):
+		url = self.manager + '/management/latest/delete-resource-backup'
+		response = requests.delete(url, headers=self.auth_header, params={'resource-id': resource_id, 'backup-id': backup_id})
+		return response
+
 	def get_blob_content(self, session_id, blob_id):
 		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/get-blob-content'
 		response = requests.get(url, params={'session-id': session_id, 'blob-id': blob_id}, stream=True)
 		return response
+
+	def get_resource_backups(self, resources_ids, criterion={}):
+		url = self.manager + '/management/client/get-resource-backups-by-criterion'
+		response = requests.post(url, headers=self.auth_header, params={}, json={'ids': resources_ids, 'criterion': criterion})
+		return response.json()
 
 	def get_model_servers(self):
 		url = self.manager + '/management/client/get-model-servers'
@@ -92,6 +102,11 @@ class BIMcloud():
 	def get_resources(self, criterion={}):
 		url = self.manager + '/management/client/get-resources-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params={}, json={**criterion})
+		return response.json()
+
+	def get_resource_backup_schedules(self, criterion={}):
+		url = self.manager + '/management/client/get-resource-backup-schedules-by-criterion'
+		response = requests.post(url, headers=self.auth_header, params={}, json=criterion)
 		return response.json()
 
 	def get_ticket(self, server_id):
@@ -114,31 +129,131 @@ class BIMcloud():
 		}
 		response = requests.post(url, params=request, data=data)
 
+	def upsert_resource_backup_schedule(self, action, target_id, schedule_id, **parameters ):
+		payload = {
+	        "id": schedule_id,
+	        "$hidden": parameters.get('hidden', False),
+	        "$visibility": parameters.get('visibility', 'full'),
+	        "backupType": parameters.get('backup_type', 'pln'),
+	        "enabled": parameters.get('enabled', True),
+	        "targetResourceId": target_id,
+	        "maxBackupCount": parameters.get('max_backup_count', 1),
+	        "repeatInterval": parameters.get('repeat_interval', 86400),
+	        "repeatCount": parameters.get('repeat_count', 1),
+	        "startTime": parameters.get('start_time', 0),
+	        "endTime": parameters.get('end_time', 0),
+	        "type": "resourceBackupSchedule",
+	        "revision": parameters.get('revision', 0)
+		}
+		url = self.manager + '/management/client/'+action+'-resource-backup-schedule'
+		if action == 'insert':
+			response = requests.post(url, headers=self.auth_header, params={}, json={**payload})
+		elif action == 'update':
+			response = requests.put(url, headers=self.auth_header, params={}, json={**payload})
+		return response
+
 class BackupManager():
 
 	def __init__(self, client):
 		self.client = client
 
-	def start(self):
+
+
+	# def start(self):
+	# 	log, blob = None, None
+	# 	last_date, copy_date = 0, 0
+	# 	data = {
+	# 		'job_updated': datetime.now().strftime('%Y-%m-%d-%H-%M-%S'),
+	# 		'resources': {}
+	# 	}
+
+	# 	log = bm.get_backup_log()
+	# 	if log:
+	# 		blob = self.client.get_blob_content(self.client.session['id'], log['id'])
+	# 		data = blob.content.decode('utf-8')
+	# 		last_date = datetime.fromtimestamp(log['$modifiedDate']/1000).strftime('%Y-%m-%d-%H-%M-%S')
+
+	# 	modified = self.get_modified(last_date)
+	# 	if modified:
+	# 		for m in modified:
+	# 			num = data['resources'][m['id']]['num'] + 1 if m['id'] in data['resources'] else 1
+	# 			data['resources'][m['id']] = {
+	# 				'name': m['name'],
+	# 				'last_change': last_date,
+	# 				"last_backup": copy_date,
+	# 				"num": num
+	# 			}
+
+	# 		write = self.write_data(json.dumps(data, indent=4), '/_LOG/job_backup.json')
+
+	def backup(self):
+		log, blob = None, None
+		last_date, copy_date = 0, 0
+		data = {
+			'job_updated': datetime.now().strftime('%Y-%m-%d-%H-%M-%S'),
+			'resources': {}
+		}
+
 		log = bm.get_backup_log()
 		if log:
 			blob = self.client.get_blob_content(self.client.session['id'], log['id'])
-			modified = self.get_modified(log['$modifiedDate'])
-		if blob and modified:
-			name = f"job_backup_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
-			data = blob.json()
-			for m in modified:
-				print (f"{m['id']} {m['name']}")
-				data[name] = len(modified)
+			data = blob.content.decode('utf-8')
+			last_date = datetime.fromtimestamp(log['$modifiedDate']/1000).strftime('%Y-%m-%d-%H-%M-%S')
 
-				write = self.write_data(data, '/_LOG/job_backup.json')
+		modified = self.get_modified(last_date)
+		if modified:
+			for m in modified:
+				backups = self.client.get_resource_backups([m['id']])
+				for b in backups:
+					# delete all
+					delete = self.client.delete_resource_backup(m['id'], b['id'])
+					print (f"Delete: {b['$resourceName']} - {b['$backupFileName']} {delete}")
+
+	def override_schedule(self):
+		resources = self.get_modified(0)
+		for r in resources:
+			print (r['name'])
+			schedules = self.client.get_resource_backup_schedules({'$eq': { 'targetResourceId': r['id']}})
+			if not schedules:
+				if r['type'] == 'library:':
+					insert = self.client.upsert_resource_backup_schedule(
+							action = 'insert',
+							target_id = r['id'],
+							schedule_id = f"bimlibrary{r['id']}",
+							backupType = 'bimlibrary',
+							enabled = False
+					)
+				else:
+					for key in ['bimproject', 'pln']:
+						insert = self.client.upsert_resource_backup_schedule(
+							action = 'insert',
+							target_id = r['id'],
+							schedule_id = f"{key}{r['id']}",
+							backupType = key,
+							enabled = False
+						)
+				print (f"Inserted: {r['id']} {insert}")
+			else:
+				for s in schedules:
+					if type(s) == dict:
+						update = self.client.upsert_resource_backup_schedule(
+							action = 'update',
+							target_id = s['targetResourceId'],
+							schedule_id = s['id'],
+							enabled = False
+						)
+						print (f"Updated: {s['id']} {update}")
+					else:
+						print (schedules)
+			del schedules
+
 
 	def get_backup_log(self):
 		blobs = self.client.get_resources(
 			criterion = {
 				'$and': [
 					{'$eq': {'type': 'blob'}},
-					{'$eq': {'$parentName': '_LOG'}}
+					{'$eq': {'name': 'job_backup.log'}}
 				]
 			}
 		)
@@ -162,7 +277,7 @@ class BackupManager():
 
 	def write_data(self, data, path):
 		# convert data
-		binary = json.dumps(data, indent = 4).encode('utf-8')
+		binary = data.encode('utf-8')
 
 		# begin batch & upload
 		batch = self.client.begin_batch_upload(self.client.session['id'], description=f"Uploading to {path}")
@@ -186,59 +301,22 @@ if __name__ == "__main__":
 
 	cmd = argparse.ArgumentParser()
 	cmd.add_argument('-m', '--manager', required=True, help='URL of the BIMcloud Manager')
-	cmd.add_argument('-c', '--client', required=False, help='Client Identification')
-	cmd.add_argument('-u', '--user', required=False, help='User Login')
-	cmd.add_argument('-p', '--password', required=False, help='User Password')
+	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
+	cmd.add_argument('-u', '--user', required=True, help='User Login')
+	cmd.add_argument('-p', '--password', required=True, help='User Password')
+	cmd.add_argument('-b', '--backup_override', required=False, help='Override Backups')
 	arg = cmd.parse_args()
 
 	try:
 		bc = BIMcloud(**vars(arg))
 		bm = BackupManager(bc)
 
-		bm.start()
+		if arg.backup_override == 'y':
+			bo = bm.override_schedule()
 
-		# data = {
-		#     "job_2025-01-23_01:47:17": [
-		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
-		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
-		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4",
-		#         "6C1C2047-14E4-4EFB-97A8-EB225A780F31",
-		#         "BF17CC81-A0E8-4D64-9456-7E37BD2896F2",
-		#         "A8A1DA3E-84E2-4E60-B3E3-412A56AE65BD",
-		#         "39FBBB2A-A5D2-4446-83BB-619E950320EA"
-		#     ],
-		#     "job_2025-02-25_01:47:17": [
-		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
-		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
-		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4"
-		#     ]
-		# }
-		# data = [
-		#     {"job_2025-01-23_01:47:17": [
-		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
-		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
-		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4",
-		#         "6C1C2047-14E4-4EFB-97A8-EB225A780F31",
-		#         "BF17CC81-A0E8-4D64-9456-7E37BD2896F2",
-		#         "A8A1DA3E-84E2-4E60-B3E3-412A56AE65BD",
-		#         "39FBBB2A-A5D2-4446-83BB-619E950320EA"
-		#     ]},
-		#     {"job_2025-02-25_01:47:17": [
-		#         "3DC3CD2A-3BE1-47A8-930E-093C60C1E871",
-		#         "F6620323-3A84-4CEB-A24C-DC5BECD15C26",
-		#         "767FBC81-6785-4364-8BE7-8BBA73CA27E4"
-		#     ]}
-		# ]
+		# backup = bm.backup()
 
-		# bm.write_data(data, '/_LOG/job_backup.json')
-		# job = bm.get_last_job()
-		# job_date = datetime.strptime(job['job_updated'], '%Y-%m-%d %H:%M:%S')
-		# job_time = int(job_date.timestamp())
 
-		# res = bm.get_modified(from_time=job_time)
-		# print(json.dumps(res, indent = 4))
-		# for r in res:
-		# 	print (r['name'])
 
 	except:
 		raise
