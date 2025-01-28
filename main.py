@@ -1,6 +1,7 @@
 import argparse
 import json
 import requests
+import time
 
 from datetime import date, datetime, timedelta
 
@@ -79,9 +80,19 @@ class BIMcloud():
 		result = response.json()
 		return result['data']
 
+	def create_resource_backup(self, resource_id, backup_type, backup_name):
+		url = self.manager + '/management/latest/create-resource-backup'
+		response = requests.post(url, headers=self.auth_header, params={'resource-id': resource_id, 'backup-type': backup_type, 'backup-name': backup_name})
+		return response.json()
+
 	def delete_resource_backup(self, resource_id, backup_id):
 		url = self.manager + '/management/latest/delete-resource-backup'
 		response = requests.delete(url, headers=self.auth_header, params={'resource-id': resource_id, 'backup-id': backup_id})
+		return response
+
+	def delete_resource_backup_schedule(self, resource_id):
+		url = self.manager + '/management/latest/delete-resource-backup-schedule'
+		response = requests.delete(url, headers=self.auth_header, params={'resource-id': resource_id})
 		return response
 
 	def get_blob_content(self, session_id, blob_id):
@@ -89,9 +100,9 @@ class BIMcloud():
 		response = requests.get(url, params={'session-id': session_id, 'blob-id': blob_id}, stream=True)
 		return response
 
-	def get_resource_backups(self, resources_ids, criterion={}):
-		url = self.manager + '/management/client/get-resource-backups-by-criterion'
-		response = requests.post(url, headers=self.auth_header, params={}, json={'ids': resources_ids, 'criterion': criterion})
+	def get_jobs(self, criterion={}, params={}):
+		url = self.manager + '/management/client/get-jobs-by-criterion'
+		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
 		return response.json()
 
 	def get_model_servers(self):
@@ -102,6 +113,11 @@ class BIMcloud():
 	def get_resources(self, criterion={}):
 		url = self.manager + '/management/client/get-resources-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params={}, json={**criterion})
+		return response.json()
+
+	def get_resource_backups(self, resources_ids, criterion={}, params={}):
+		url = self.manager + '/management/client/get-resource-backups-by-criterion'
+		response = requests.post(url, headers=self.auth_header, params=params, json={'ids': resources_ids, 'criterion': criterion})
 		return response.json()
 
 	def get_resource_backup_schedules(self, criterion={}):
@@ -129,29 +145,6 @@ class BIMcloud():
 		}
 		response = requests.post(url, params=request, data=data)
 
-	def upsert_resource_backup_schedule(self, action, target_id, schedule_id, **parameters ):
-		payload = {
-	        "id": schedule_id,
-	        "$hidden": parameters.get('hidden', False),
-	        "$visibility": parameters.get('visibility', 'full'),
-	        "backupType": parameters.get('backup_type', 'pln'),
-	        "enabled": parameters.get('enabled', True),
-	        "targetResourceId": target_id,
-	        "maxBackupCount": parameters.get('max_backup_count', 1),
-	        "repeatInterval": parameters.get('repeat_interval', 86400),
-	        "repeatCount": parameters.get('repeat_count', 1),
-	        "startTime": parameters.get('start_time', 0),
-	        "endTime": parameters.get('end_time', 0),
-	        "type": "resourceBackupSchedule",
-	        "revision": parameters.get('revision', 0)
-		}
-		url = self.manager + '/management/client/'+action+'-resource-backup-schedule'
-		if action == 'insert':
-			response = requests.post(url, headers=self.auth_header, params={}, json={**payload})
-		elif action == 'update':
-			response = requests.put(url, headers=self.auth_header, params={}, json={**payload})
-		return response
-
 class BackupManager():
 
 	def __init__(self, client):
@@ -159,121 +152,67 @@ class BackupManager():
 
 
 
-	# def start(self):
-	# 	log, blob = None, None
-	# 	last_date, copy_date = 0, 0
-	# 	data = {
-	# 		'job_updated': datetime.now().strftime('%Y-%m-%d-%H-%M-%S'),
-	# 		'resources': {}
-	# 	}
-
-	# 	log = bm.get_backup_log()
-	# 	if log:
-	# 		blob = self.client.get_blob_content(self.client.session['id'], log['id'])
-	# 		data = blob.content.decode('utf-8')
-	# 		last_date = datetime.fromtimestamp(log['$modifiedDate']/1000).strftime('%Y-%m-%d-%H-%M-%S')
-
-	# 	modified = self.get_modified(last_date)
-	# 	if modified:
-	# 		for m in modified:
-	# 			num = data['resources'][m['id']]['num'] + 1 if m['id'] in data['resources'] else 1
-	# 			data['resources'][m['id']] = {
-	# 				'name': m['name'],
-	# 				'last_change': last_date,
-	# 				"last_backup": copy_date,
-	# 				"num": num
-	# 			}
-
-	# 		write = self.write_data(json.dumps(data, indent=4), '/_LOG/job_backup.json')
 
 	def backup(self):
-		log, blob = None, None
-		last_date, copy_date = 0, 0
-		data = {
-			'job_updated': datetime.now().strftime('%Y-%m-%d-%H-%M-%S'),
-			'resources': {}
-		}
-
-		log = bm.get_backup_log()
-		if log:
-			blob = self.client.get_blob_content(self.client.session['id'], log['id'])
-			data = blob.content.decode('utf-8')
-			last_date = datetime.fromtimestamp(log['$modifiedDate']/1000).strftime('%Y-%m-%d-%H-%M-%S')
-
-		modified = self.get_modified(last_date)
-		if modified:
-			for m in modified:
-				backups = self.client.get_resource_backups([m['id']])
-				for b in backups:
-					# delete all
-					delete = self.client.delete_resource_backup(m['id'], b['id'])
-					print (f"Delete: {b['$resourceName']} - {b['$backupFileName']} {delete}")
-
-	def override_schedule(self):
-		resources = self.get_modified(0)
+		"""	Starts resource backup procedure.
+		"""
+		# resources = self.client.get_resources({'$eq': {'type': 'project'}}, )
+		resources = self.client.get_resources({'$eq': {'id': '1A787BDC-5498-4A87-A254-FD1F9991F20C'}}, )
 		for r in resources:
-			print (r['name'])
+			has_valid_backup = False
+			backups = self.client.get_resource_backups([r['id']], params={'sort-by': '$time', 'sort-direction': 'desc'})
+			if backups[0] and backups[0].get('$time') >= r['$modifiedDate']:
+				has_valid_backup = True				
+
+			if not has_valid_backup and r['type'] == 'project':
+				# create new backup
+				create = self.create_project_backup(r['id'])
+				# remove all obsolete backups
+				for b in backups:
+					if b['$time'] <= r['$modifiedDate']:
+						delete = self.client.delete_resource_backup(r['id'], b['id'])
+
+	def create_project_backup(self, resource_id):
+		"""	Creates a new backup for project resource if necessary.
+			Args:
+				resource_id (str): Resource id
+			Returns:
+				bool: True if process succeded
+		"""
+		print (resource_id)
+		response, job = None, None
+		response = self.client.create_resource_backup(resource_id, 'bimproject', 'Scripted Backup 1')
+		if response and response.get('id'):
+			job = response
+			while job['status'] not in ['completed', 'failed']:
+				job = self.client.get_jobs(
+					criterion = {
+						'$and': [
+							{'$eq': {'jobType': 'createProjectBackup'}},
+							{'$eq': {'id': response['id']}}
+						]
+					}
+				)[0]
+				print (f"{job['status']}: {job['progress']['current']} / {job['progress']['max']} ",  end='\r')
+				time.sleep(1.5)
+
+		if job['status'] == 'completed':
+			return True
+		return False
+
+	def delete_schedules(self):
+		d = 0
+		resources = self.client.get_resources({'$eq': {'type': 'project'}})
+		for r in resources:
 			schedules = self.client.get_resource_backup_schedules({'$eq': { 'targetResourceId': r['id']}})
-			if not schedules:
-				if r['type'] == 'library:':
-					insert = self.client.upsert_resource_backup_schedule(
-							action = 'insert',
-							target_id = r['id'],
-							schedule_id = f"bimlibrary{r['id']}",
-							backupType = 'bimlibrary',
-							enabled = False
-					)
-				else:
-					for key in ['bimproject', 'pln']:
-						insert = self.client.upsert_resource_backup_schedule(
-							action = 'insert',
-							target_id = r['id'],
-							schedule_id = f"{key}{r['id']}",
-							backupType = key,
-							enabled = False
-						)
-				print (f"Inserted: {r['id']} {insert}")
-			else:
+			if schedules:
 				for s in schedules:
-					if type(s) == dict:
-						update = self.client.upsert_resource_backup_schedule(
-							action = 'update',
-							target_id = s['targetResourceId'],
-							schedule_id = s['id'],
-							enabled = False
-						)
-						print (f"Updated: {s['id']} {update}")
-					else:
-						print (schedules)
-			del schedules
+					delete = self.client.delete_resource_backup_schedule(s['id'])
+					# print (f"Deleted: {s['id']} {delete}")
+					d =+ 1
+		print (f"Deleted: {d} backup schedules")
 
 
-	def get_backup_log(self):
-		blobs = self.client.get_resources(
-			criterion = {
-				'$and': [
-					{'$eq': {'type': 'blob'}},
-					{'$eq': {'name': 'job_backup.log'}}
-				]
-			}
-		)
-		if blobs:
-			return blobs[0]
-		return None
-
-	def get_modified(self, from_time=0):
-		resources = self.client.get_resources(
-			criterion = {
-				'$and': [
-					{'$gte': {'$modifiedDate': from_time }},
-					{'$or': [
-						{'$eq': {'type': 'project'}},
-						{'$eq': {'type': 'library'}}
-					]}
-				]
-			}
-		)
-		return resources
 
 	def write_data(self, data, path):
 		# convert data
@@ -304,17 +243,18 @@ if __name__ == "__main__":
 	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
 	cmd.add_argument('-u', '--user', required=True, help='User Login')
 	cmd.add_argument('-p', '--password', required=True, help='User Password')
-	cmd.add_argument('-b', '--backup_override', required=False, help='Override Backups')
+	cmd.add_argument('-b', '--disable_schedules', required=False, help='Disable backup schedules')
 	arg = cmd.parse_args()
 
 	try:
 		bc = BIMcloud(**vars(arg))
 		bm = BackupManager(bc)
 
-		if arg.backup_override == 'y':
-			bo = bm.override_schedule()
+		# ensure remove any new backup schedule, if enabled
+		if arg.disable_schedules == 'y':
+			ds = bm.delete_schedules()
 
-		# backup = bm.backup()
+		bcp = bm.backup()
 
 
 
