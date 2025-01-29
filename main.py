@@ -46,26 +46,6 @@ class BIMcloud():
 		except:
 			raise
 
-	def begin_batch_upload(self, session_id, description='batch-upload'):
-		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/begin-batch-upload'
-		response = requests.post(url, params={'session-id': session_id, 'description': description})
-		return response.json()['data']
-
-	def begin_upload(self, session_id, blob_name, namespace):
-		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/begin-upload'
-		response = requests.post(url, params={'session-id': session_id, 'blob-name': blob_name, 'namespace-name': namespace})
-		return response.json()['data']
-
-	def commit_batch_upload(self, session_id, batch_id):
-		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/commit-batch-upload'
-		response = requests.post(url, params={'session-id': session_id, 'batch-upload-session-id': batch_id, 'conflict-behavior': 'overwrite'})
-		return response
-
-	def commit_upload(self, session_id, upload_id):
-		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/commit-upload'
-		response = requests.post(url, params={'session-id': session_id, 'upload-session-id': upload_id})
-		return response
-
 	def create_session(self, username, ticket):
 		request = {
 			'data-content-type': 'application/vnd.graphisoft.teamwork.session-service-1.0.authentication-request-1.0+json',
@@ -95,11 +75,6 @@ class BIMcloud():
 		response = requests.delete(url, headers=self.auth_header, params={'resource-id': resource_id})
 		return response
 
-	def get_blob_content(self, session_id, blob_id):
-		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/get-blob-content'
-		response = requests.get(url, params={'session-id': session_id, 'blob-id': blob_id}, stream=True)
-		return response
-
 	def get_jobs(self, criterion={}, params={}):
 		url = self.manager + '/management/client/get-jobs-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
@@ -125,25 +100,6 @@ class BIMcloud():
 		response = requests.post(url, headers=self.auth_header, params={}, json=criterion)
 		return response.json()
 
-	def get_ticket(self, server_id):
-		url = self.manager + '/management/latest/ticket-generator/get-ticket'
-		payload = {
-			'type': 'freeTicket',
-			'resources': [server_id],
-			'format': 'base64'
-		}
-		response = requests.post(url, headers=self.auth_header, json=payload)
-		return response.content.decode('utf-8')
-
-	def put_blob_content_part(self, session_id, upload_id, data, offset=0):
-		url = self.manager[:-1] + '1' + '/blob-store-service/1.0/put-blob-content-part'
-		request = {
-			'session-id': session_id,
-			'upload-session-id': upload_id,
-			'offset': offset,
-			'length': len(data)
-		}
-		response = requests.post(url, params=request, data=data)
 
 class BackupManager():
 
@@ -151,37 +107,48 @@ class BackupManager():
 		self.client = client
 
 
-
-
-	def backup(self):
+	def backup(self) -> None:
 		"""	Starts resource backup procedure.
 		"""
-		# resources = self.client.get_resources({'$eq': {'type': 'project'}}, )
-		resources = self.client.get_resources({'$eq': {'id': '1A787BDC-5498-4A87-A254-FD1F9991F20C'}}, )
+		criterion = {
+			'$or': [
+				{'$eq': {'id': '9469F25B-D6DD-4CC3-8026-B85AC8338A16'}},
+				{'$eq': {'id': '1FFABC82-3AEE-4509-B04D-E1789CEFFA62'}}
+			]
+		}
+		resources = self.client.get_resources(criterion)
 		for r in resources:
-			has_valid_backup = False
-			backups = self.client.get_resource_backups([r['id']], params={'sort-by': '$time', 'sort-direction': 'desc'})
-			if backups[0] and backups[0].get('$time') >= r['$modifiedDate']:
-				has_valid_backup = True				
+			print (f"Project: {r['id']}")
+			has_outdated_backup = True
+			backups = self.client.get_resource_backups([r['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or None
+			# check backups
+			if backups:
+				if backups[0].get('$time') >= r['$modifiedDate']:
+					has_outdated_backup = False
+				else:
+					for b in backups:
+						if b['$time'] <= r['$modifiedDate']:
+							delete = self.delete_project_backup(r['id'], b['id'])
+							print (f"Delete: {b['id']} {delete}")
+			# create new if necessary
+			if has_outdated_backup and r['type'] == 'project':
+				ts = time.time()
+				creation_job = self.create_project_backup(r['id'])
+				is_valid = self.validate_project_backup(creation_job, ts)
+				if is_valid:
+					print ('OK')
+			# don't hurry up
+			time.sleep(1)
 
-			if not has_valid_backup and r['type'] == 'project':
-				# create new backup
-				create = self.create_project_backup(r['id'])
-				# remove all obsolete backups
-				for b in backups:
-					if b['$time'] <= r['$modifiedDate']:
-						delete = self.client.delete_resource_backup(r['id'], b['id'])
-
-	def create_project_backup(self, resource_id):
-		"""	Creates a new backup for project resource if necessary.
-			Args:
-				resource_id (str): Resource id
-			Returns:
-				bool: True if process succeded
+	def create_project_backup(self, resource_id: str):
+		"""	Creates a new backup for project resource.
+		Args:
+			resource_id (str): Resource id
+		Returns:
+			bool: True if process succeded
 		"""
-		print (resource_id)
 		response, job = None, None
-		response = self.client.create_resource_backup(resource_id, 'bimproject', 'Scripted Backup 1')
+		response = self.client.create_resource_backup(resource_id, 'bimproject', 'Scripted Backup')
 		if response and response.get('id'):
 			job = response
 			while job['status'] not in ['completed', 'failed']:
@@ -194,11 +161,53 @@ class BackupManager():
 					}
 				)[0]
 				print (f"{job['status']}: {job['progress']['current']} / {job['progress']['max']} ",  end='\r')
-				time.sleep(1.5)
+				time.sleep(2)
 
 		if job['status'] == 'completed':
-			return True
+			print ('\n')
+			return job
+		return None
+
+	def delete_project_backup(self, resource_id, backup_id):
+		"""	Removes targeted backup.
+		Args:
+			resource_id (str): Resource (project) id
+			backup_id (str): Backup id
+		Returns:
+			bool: True if process succeded
+		"""
+		response = self.client.delete_resource_backup(resource_id, backup_id)
+		return response
+
+	def validate_project_backup(self, job, ts):
+		"""	Validates created backup by checking it's existing & props.
+		Args:
+			job (dict): Job dictionary object, after creation is launched
+			ts (int): Timestamp of backup creation
+		Returns:
+			bool: True if validation succeded
+		"""
+		if job:
+			resource_id = next(filter(lambda x: x['name'] == 'projectId', job['properties']), {}).get('value')
+			backup = self.client.get_resource_backups(
+				[resource_id],
+				criterion = {
+					'$and': [
+						{'$eq': {'$resourceId': resource_id}},
+						{'$gte': {'$time': ts}}
+					]
+				},
+				params = {
+					'sort-by': '$time',
+					'sort-direction': 'desc'
+				}
+			)[0] or None
+			if backup and \
+				backup.get('$statusId') == '_server.backup.status.done' and \
+				backup.get('$fileSize') > 0:
+				return True
 		return False
+
 
 	def delete_schedules(self):
 		d = 0
@@ -211,29 +220,6 @@ class BackupManager():
 					# print (f"Deleted: {s['id']} {delete}")
 					d =+ 1
 		print (f"Deleted: {d} backup schedules")
-
-
-
-	def write_data(self, data, path):
-		# convert data
-		binary = data.encode('utf-8')
-
-		# begin batch & upload
-		batch = self.client.begin_batch_upload(self.client.session['id'], description=f"Uploading to {path}")
-		upload = self.client.begin_upload(self.client.session['id'], path, batch['namespace-name'])
-		
-		# write
-		CHUNK_SIZE = 1024 * 512
-		offset = 0
-		while offset < len(binary):
-			chunk = binary[offset:offset + CHUNK_SIZE]
-			self.client.put_blob_content_part(self.client.session['id'], upload['id'], chunk, offset=offset)
-			offset += CHUNK_SIZE
-
-		# commit
-		commit_upload = self.client.commit_upload(self.client.session['id'], upload['id'])
-		commit_batch = self.client.commit_batch_upload(self.client.session['id'], batch['id'])
-		print(f"Upload: {path} {commit_batch}")
 
 
 if __name__ == "__main__":
