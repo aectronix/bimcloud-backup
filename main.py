@@ -33,6 +33,7 @@ class BIMcloud():
 			result = response.json() if json else response.content
 			self.auth = result
 			self.auth_header = {'Authorization': f"Bearer {result['access_token']}"}
+			print(f"Connected to {self.manager}")
 		except:
 			raise
 
@@ -100,16 +101,27 @@ class BIMcloud():
 		response = requests.post(url, headers=self.auth_header, params={}, json=criterion)
 		return response.json()
 
+	def get_ticket(self, server_id):
+		url = self.manager + '/management/latest/ticket-generator/get-ticket'
+		payload = {
+			'type': 'freeTicket',
+			'resources': [server_id],
+			'format': 'base64'
+		}
+		response = requests.post(url, headers=self.auth_header, json=payload)
+		return response.content.decode('utf-8')
+
 
 class BackupManager():
 
 	def __init__(self, client):
+		print (f"Initializing backup manager with {type(client)}")
 		self.client = client
-
 
 	def backup(self) -> None:
 		"""	Starts resource backup procedure.
 		"""
+		print (f"Starting backup routine...")
 		criterion = {
 			'$or': [
 				{'$eq': {'id': '9469F25B-D6DD-4CC3-8026-B85AC8338A16'}},
@@ -118,7 +130,7 @@ class BackupManager():
 		}
 		resources = self.client.get_resources(criterion)
 		for r in resources:
-			print (f"Project: {r['id']}")
+			print (f"Resource: {r['id']} ({r['name']})")
 			has_outdated_backup = True
 			backups = self.client.get_resource_backups([r['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or None
 			# check backups
@@ -147,6 +159,7 @@ class BackupManager():
 		Returns:
 			bool: True if process succeded
 		"""
+		print (f"Creating a new backup...")
 		response, job = None, None
 		response = self.client.create_resource_backup(resource_id, 'bimproject', 'Scripted Backup')
 		if response and response.get('id'):
@@ -160,11 +173,11 @@ class BackupManager():
 						]
 					}
 				)[0]
-				print (f"{job['status']}: {job['progress']['current']} / {job['progress']['max']} ",  end='\r')
+				print (f"> {job['status']}: {job['progress']['current']} / {job['progress']['max']} ",  end='\r')
 				time.sleep(2)
 
 		if job['status'] == 'completed':
-			print ('\n')
+			print ('')
 			return job
 		return None
 
