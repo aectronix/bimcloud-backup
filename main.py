@@ -5,11 +5,12 @@ import time
 
 from datetime import date, datetime, timedelta
 
+DELTA = 15 - 3600
 BACKUP_SCHEDULE = {
     'id': None,
     '$hidden': False,
     "$visibility": 'full',
-    'backupType': 'bimproject',
+    'backupType': None,
     'enabled': True,
     'targetResourceId': None,
     'maxBackupCount': 1,
@@ -159,7 +160,7 @@ class BackupManager():
 				has_outdated_backup = False
 			# create new, remove old
 			if has_outdated_backup:
-				ts = time.time()
+				start_time = time.time()
 
 				if r['type'] == 'project':
 					for b in backups:
@@ -167,18 +168,19 @@ class BackupManager():
 							delete_job = self.delete_project_backup(r['id'], b['id'])
 							print (f"Delete: {b['id']} {delete_job}")
 					create_job = self.create_project_backup(r['id'])
-					is_valid = self.validate_project_backup(create_job, ts)
+					is_valid = self.validate_project_backup(create_job, start_time)
 					if is_valid:
 						print ('OK')
 
 				if r['type'] == 'library':
 					library_job = self.create_library_backup(
 						r['id'],
+						backupType = 'bimlibrary',
 						maxBackupCount = 1,
 						repeatInterval = 3600,
-						startTime = ts + 15 - 3600
+						startTime = start_time + DELTA
 					)
-					# is_valid = self.validate_library_backup(r['id'], ts)
+					# is_valid = self.validate_library_backup(r['id'], start_time)
 					# if is_valid:
 					# 	print ('OK')
 
@@ -231,7 +233,6 @@ class BackupManager():
 		schedule = BACKUP_SCHEDULE
 		schedule['id'] = 'bimlibrary'+resource_id
 		schedule['targetResourceId'] = resource_id
-		schedule['backupType'] = 'bimlibrary'
 		for key, value in parameters.items():
 			if key in schedule:
 				schedule[key] = value
@@ -239,9 +240,9 @@ class BackupManager():
 		if response:
 			print (f"Inserted, awaiting scheduler to create backup")
 			backup = None
-			start = (schedule['startTime'] - 15 + 3600) * 1000
+			start_time = (schedule['startTime'] - DELTA) * 1000
 			spent = 0
-			while not backup or backup.get('$time') < start:
+			while not backup or backup.get('$time') < start_time:
 				spent += 1
 				response = self.client.get_resource_backups(
 					[resource_id],
@@ -249,7 +250,7 @@ class BackupManager():
 						'$and': [
 							{'$eq': {'$resourceId': resource_id}},
 							{'$eq': {'$formatId': '_server.backup.format.bimlibrary-automatic'}},
-							{'$gte': {'$time': start}}
+							{'$gte': {'$time': start_time}}
 						]
 					},
 					params = {
@@ -261,7 +262,7 @@ class BackupManager():
 					backup = response[0]
 				print (f"> Waiting for creation, time passed: {spent}   ",  end='\r')
 				time.sleep(1)
-			if backup and backup.get('$time') >= start:
+			if backup and backup.get('$time') >= start_time:
 				print ('')
 				print ('Backup created')
 			# remove schedule
@@ -269,11 +270,11 @@ class BackupManager():
 			print (f"Reset schedule: {schedule_delete}")
 
 
-	def validate_project_backup(self, job, ts):
+	def validate_project_backup(self, job, start_time):
 		"""	Validates created backup by checking it's existing & props.
 		Args:
 			job (dict): Job dictionary object, after creation is launched
-			ts (int): Timestamp of backup creation
+			start_time (int): Timestamp of backup creation
 		Returns:
 			bool: True if validation succeded
 		"""
@@ -284,7 +285,7 @@ class BackupManager():
 				criterion = {
 					'$and': [
 						{'$eq': {'$resourceId': resource_id}},
-						{'$gte': {'$time': ts}}
+						{'$gte': {'$time': start_time}}
 					]
 				},
 				params = {
@@ -298,7 +299,7 @@ class BackupManager():
 				return True
 		return False
 
-	# def validate_library_backup(self, resource_id, ts):
+	# def validate_library_backup(self, resource_id, start_time):
 	# 	return False
 
 
