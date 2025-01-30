@@ -129,11 +129,28 @@ class BIMcloud():
 		response = requests.post(url, headers=self.auth_header, json=payload)
 		return response.content.decode('utf-8')
 
-	def insert_resource_backup_schedule(self, data):
+	def insert_resource_backup_schedule(
+			self,
+			targetResourceId,
+			backupType,
+			enabled = True,
+			maxBackupCount = 1,
+			repeatInterval = 3600,
+			repeatCount = 0,
+			startTime = 0,
+			endTime = 0,
+			type = 'resourceBackupSchedule',
+			revision = 0
+		):
+		schedule = {
+			'id': backupType+targetResourceId,
+			'$hidden': False,
+			"$visibility": 'full'
+		}
+		schedule = {key: value for key, value in locals().items() if key not in ('self')}
 		url = self.manager + '/management/client/insert-resource-backup-schedule'
-		response = requests.post(url, headers=self.auth_header, json=data)
+		response = requests.post(url, headers=self.auth_header, json=schedule)
 		return response
-
 
 class BackupManager():
 
@@ -159,7 +176,7 @@ class BackupManager():
 		criterion = {
 			'$or': [
 				# {'$eq': {'id': '9469F25B-D6DD-4CC3-8026-B85AC8338A16'}},
-				{'$eq': {'id': '8E539125-25D2-48F7-AE49-755D6AB6E293'}}
+				{'$eq': {'id': '9C0BF882-923B-4315-9426-469D23110A2F'}}
 			]
 		}
 		resources = self.client.get_resources(criterion)
@@ -185,13 +202,7 @@ class BackupManager():
 						print ('OK')
 
 				if resource['type'] == 'library':
-					library_create_r = self.create_library_backup(
-						resource,
-						backupType = 'bimlibrary',
-						maxBackupCount = 1,
-						repeatInterval = 3600,
-						startTime = start_time + DELTA
-					)
+					library_create_r = self.create_library_backup(resource, startTime = start_time + DELTA )
 					is_valid = self.validate_library_backup(resource['id'], library_create_r, start_time*1000)
 					if is_valid:
 						print ('OK')
@@ -210,7 +221,11 @@ class BackupManager():
 		start_time = time.time()
 		timeout = self.get_timeout_from_filesize(resource['$size'])
 		response, job = None, None
-		response = self.client.create_resource_backup(resource['id'], 'bimproject', 'Scripted Backup')
+		response = self.client.create_resource_backup(
+			resource['id'],
+			'bimproject',
+			'Scripted Backup'
+		)
 		if response and response.get('id'):
 			job = response
 			while job['status'] not in ['completed', 'failed']:
@@ -277,16 +292,16 @@ class BackupManager():
 	def create_library_backup(self, resource, **parameters):
 		print (f"Inserting temporary backup schedule to trigger auto backup")
 		timeout = self.get_timeout_from_filesize(resource['$size'])
-		schedule = BACKUP_SCHEDULE
-		schedule['id'] = 'bimlibrary'+resource['id']
-		schedule['targetResourceId'] = resource['id']
-		for key, value in parameters.items():
-			if key in schedule:
-				schedule[key] = value
-		response = self.client.insert_resource_backup_schedule(schedule)
+		response = self.client.insert_resource_backup_schedule(
+			targetResourceId = resource['id'],
+			backupType = 'bimlibrary',
+			maxBackupCount = 1,
+			repeatInterval = 3600,
+			startTime = parameters.get('startTime')
+		)
 		if response:
 			print (f"Inserted, awaiting scheduler to create backup")
-			plan_time = (schedule['startTime'] - DELTA) * 1000
+			plan_time = (parameters.get('startTime') - DELTA) * 1000
 			start_time = time.time()
 			backup = None
 			while not backup or backup.get('$time') < plan_time:
