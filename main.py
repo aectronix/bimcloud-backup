@@ -142,12 +142,15 @@ class BackupManager():
 		self.client = client
 
 	@staticmethod
-	def get_timeout_from_filesize(size):
+	def get_timeout_from_filesize(size, b=60.0, f=15.0, e=1.45, div=1000000):
 		"""	Calculates timeout while processing the file regarding it's size in bytes.
-			Starting timeout defined by t; curve steepness defined by s.
+		Args:
+			b (int): 	base time, seconds
+			f (int): 	scaling factor
+			e (int): 	exponent power
+			div (int):	division, bytes (to get Kb, Mb, Gb etc as input factor)
 		"""
-		t, s, base = 0.85, 1.0065, 60
-		return base + t * (s ** (size/1000000))
+		return b + round(f * (size/div ** e))
 
 	def backup(self) -> None:
 		"""	Starts resource backup procedure.
@@ -161,7 +164,7 @@ class BackupManager():
 		}
 		resources = self.client.get_resources(criterion)
 		for resource in resources:
-			print (f"Resource: {resource['id']} (\"{resource['name']}\")")
+			print (f"Resource: {resource['id']} ({resource['type']}: \"{resource['name']}\")")
 			has_outdated_backup = True
 			backups = self.client.get_resource_backups([resource['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or []
 			# check backups
@@ -176,7 +179,7 @@ class BackupManager():
 						if b and b.get('$time') <= resource['$modifiedDate']:
 							project_delete_r = self.delete_project_backup(resource['id'], b['id'])
 							print (f"Delete: {b['id']} {project_delete_r}")
-					project_create_r = self.create_project_backup(resource['id'])
+					project_create_r = self.create_project_backup(resource)
 					is_valid = self.validate_project_backup(project_create_r, start_time)
 					if is_valid:
 						print ('OK')
@@ -204,12 +207,18 @@ class BackupManager():
 			bool: True if process succeded
 		"""
 		print (f"Creating a new backup")
+		start_time = time.time()
+		timeout = self.get_timeout_from_filesize(resource['$size'])
 		response, job = None, None
 		response = self.client.create_resource_backup(resource['id'], 'bimproject', 'Scripted Backup')
 		if response and response.get('id'):
 			job = response
 			while job['status'] not in ['completed', 'failed']:
-				print (f"> {job['status']}: {job['progress']['current']} / {job['progress']['max']} ",  end='\r')
+				spent_time = round(time.time() - start_time)
+				print (f"> {job['status']}: {job['progress']['current']} / {job['progress']['max']} time passed: {spent_time} / {round(timeout)}\t",  end='\r')
+				if spent_time >= timeout:
+					print (f"\nTimeout exceeded!")
+					break
 				job = self.client.get_jobs(
 					criterion = {
 						'$and': [
@@ -218,7 +227,7 @@ class BackupManager():
 						]
 					}
 				)[0]
-				time.sleep(2)
+				time.sleep(1)
 
 		if job['status'] == 'completed':
 			print ('')
@@ -277,22 +286,22 @@ class BackupManager():
 		response = self.client.insert_resource_backup_schedule(schedule)
 		if response:
 			print (f"Inserted, awaiting scheduler to create backup")
+			plan_time = (schedule['startTime'] - DELTA) * 1000
+			start_time = time.time()
 			backup = None
-			start_time = (schedule['startTime'] - DELTA) * 1000
-			spent_time = 0
-			while not backup or backup.get('$time') < start_time:
-				print (f"> Waiting for creation, time passed: {spent_time} / {round(timeout)}",  end='\r', flush=True)
+			while not backup or backup.get('$time') < plan_time:
+				spent_time = round(time.time() - start_time)
+				print (f"> Waiting for creation, time passed: {spent_time} / {round(timeout)}\t",  end='\r', flush=True)
 				if spent_time >= timeout:
 					print (f"\nTimeout exceeded!")
 					break
-				spent_time += 1
 				response = self.client.get_resource_backups(
 					[resource['id']],
 					criterion = {
 						'$and': [
 							{'$eq': {'$resourceId': resource['id']}},
 							{'$eq': {'$formatId': '_server.backup.format.bimlibrary-automatic'}},
-							{'$gte': {'$time': start_time}}
+							{'$gte': {'$time': plan_time}}
 						]
 					},
 					params = {
@@ -305,6 +314,7 @@ class BackupManager():
 				time.sleep(1)
 		# remove schedule
 		schedule_delete = self.client.delete_resource_backup_schedule('bimlibrary'+resource['id'])
+		print (f"")
 		print (f"Reset schedule: {schedule_delete}")
 		# finalize
 		if backup and backup.get('$time') >= start_time:
@@ -368,6 +378,8 @@ if __name__ == "__main__":
 			ds = bm.delete_schedules()
 
 		bcp = bm.backup()
+
+		# print (bm.get_timeout_from_filesize(1000*1000*1000*3))
 
 
 
