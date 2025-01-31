@@ -6,7 +6,7 @@ import time
 
 from datetime import date, datetime, timedelta
 
-DELTA = 10 - 3600
+DELTA = 15 - 3600
 BACKUP_SCHEDULE = {
     'id': None,
     '$hidden': False,
@@ -51,7 +51,6 @@ class BIMcloud():
 			result = response.json() if json else response.content
 			self.auth = result
 			self.auth_header = {'Authorization': f"Bearer {result['access_token']}"}
-			print(f"Connected to {self.manager}")
 		except:
 			raise
 
@@ -104,9 +103,14 @@ class BIMcloud():
 		response = requests.get(url, headers=self.auth_header)
 		return response.json()
 
-	def get_resources(self, criterion={}):
+	def get_resources_by_criterion(self, criterion={}, params={}):
 		url = self.manager + '/management/client/get-resources-by-criterion'
-		response = requests.post(url, headers=self.auth_header, params={}, json={**criterion})
+		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
+		return response.json()
+
+	def get_resources_by_id_list(self, ids, params):
+		url = self.manager + '/management/client/get-resources-by-id-list'
+		response = requests.post(url, headers=self.auth_header, params=params, json=ids)
 		return response.json()
 
 	def get_resource_backups(self, resources_ids, criterion={}, params={}):
@@ -154,9 +158,10 @@ class BIMcloud():
 
 class BackupManager():
 
-	def __init__(self, client):
-		print (f"Initializing backup manager with {type(client)}")
+	def __init__(self, client, **parameters):
+		print (f"Initializing backup manager for {client.manager}...")
 		self.client = client
+		self.schedule_enabled = parameters.get('schedule_enabled')
 
 	@staticmethod
 	def get_timeout_from_filesize(size, b=60.0, f=15.0, e=1.45, div=1000000):
@@ -169,24 +174,29 @@ class BackupManager():
 		"""
 		return b + round(f * (size/div ** e))
 
-	def backup(self) -> None:
+	def backup(self, ids=[]) -> None:
 		"""	Starts resource backup procedure.
 		"""
-		print (f"Starting backup routine...")
-		criterion = {
-			'$or': [
-				# {'$eq': {'id': '9469F25B-D6DD-4CC3-8026-B85AC8338A16'}},
-				{'$eq': {'id': '9C0BF882-923B-4315-9426-469D23110A2F'}}
-			]
-		}
-		resources = self.client.get_resources(criterion)
+		i = 0
+		resources = self.get_resources(ids)
+		print (f"Found: {len(resources)}, starting backup process...")
 		for resource in resources:
-			print (f"Resource: {resource['id']} ({resource['type']}: \"{resource['name']}\")")
+			i += 1
+			print (f"Resource #{i}: {resource['id']} ({resource['type']}: \"{resource['name']}\")")
+			# remove all schedules if required
+			schedules = self.client.get_resource_backup_schedules({'$eq': {'targetResourceId': resource['id']}})
+			if schedules and self.schedule_enabled == 'n':
+				for s in schedules:
+					schedule_delete_r = self.client.delete_resource_backup_schedule(s['id'])
+				print (f"Deleted: {len(schedules)} backup schedules, {schedule_delete_r}")
+
+			# check backups
 			has_outdated_backup = True
 			backups = self.client.get_resource_backups([resource['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or []
-			# check backups
-			if backups and backups[0].get('$time') >= resource['$modifiedDate']:
+			if 	(backups and backups[0].get('$time') >= resource['$modifiedDate']) or \
+				(not backups and resource['$modifiedDate'] == resource['$uploadedTime']):
 				has_outdated_backup = False
+
 			# create new, remove old
 			if has_outdated_backup:
 				start_time = time.time()
@@ -202,13 +212,30 @@ class BackupManager():
 						print ('OK')
 
 				if resource['type'] == 'library':
+					# if backups and backups[0]['revision'] > resource['modifiedDate']
 					library_create_r = self.create_library_backup(resource, startTime = start_time + DELTA )
 					is_valid = self.validate_library_backup(resource['id'], library_create_r, start_time*1000)
 					if is_valid:
 						print ('OK')
-
+			else:
+				print (f"Resource has valid backup, skipped")
 			# don't hurry up
 			time.sleep(1)
+
+	def get_resources(self, ids=[]):
+		params = { 'sort-by': '$time', 'sort-direction': 'desc' }
+		if ids:
+			return self.client.get_resources_by_id_list(ids, params)
+		return self.client.get_resources_by_criterion(
+			{
+				'$or': [
+					{'$eq': {'type': 'project'}},
+					{'$eq': {'type': 'library'}},
+				]
+			},
+			params
+		)
+
 
 	def create_project_backup(self, resource):
 		"""	Creates a new backup for project resource.
@@ -360,43 +387,31 @@ class BackupManager():
 			return True
 		return False
 
-	def delete_schedules(self):
-		d = 0
-		resources = self.client.get_resources({'$eq': {'type': 'project'}})
-		for r in resources:
-			schedules = self.client.get_resource_backup_schedules({'$eq': { 'targetResourceId': r['id']}})
-			if schedules:
-				for s in schedules:
-					delete = self.client.delete_resource_backup_schedule(s['id'])
-					# print (f"Deleted: {s['id']} {delete}")
-					d =+ 1
-		print (f"Deleted: {d} backup schedules")
-
 
 if __name__ == "__main__":
+
+	start_time = time.time()
 
 	cmd = argparse.ArgumentParser()
 	cmd.add_argument('-m', '--manager', required=True, help='URL of the BIMcloud Manager')
 	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
 	cmd.add_argument('-u', '--user', required=True, help='User Login')
 	cmd.add_argument('-p', '--password', required=True, help='User Password')
-	cmd.add_argument('-b', '--disable_schedules', required=False, help='Disable backup schedules')
+	cmd.add_argument('-s', '--schedule_enabled', required=False, help='Enable default schedules')
 	arg = cmd.parse_args()
 
 	try:
-		bc = BIMcloud(**vars(arg))
-		bm = BackupManager(bc)
+		cloud = BIMcloud(**vars(arg))
+		manager = BackupManager(
+			cloud,
+			schedule_enabled = arg.schedule_enabled
+		)
 
-
-		# ensure remove any new backup schedule, if enabled
-		if arg.disable_schedules == 'y':
-			ds = bm.delete_schedules()
-
-		bcp = bm.backup()
+		bcp = manager.backup(['4292A87F-BD20-4D54-B377-55F93D3AE202'])
 
 		# print (bm.get_timeout_from_filesize(1000*1000*1000*3))
 
-
-
 	except:
 		raise
+
+	print (f"Completed in {round(time.time()-start_time)} sec")
