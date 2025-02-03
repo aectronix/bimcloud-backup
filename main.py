@@ -7,21 +7,6 @@ import time
 from datetime import date, datetime, timedelta
 
 DELTA = 15 - 3600
-BACKUP_SCHEDULE = {
-    'id': None,
-    '$hidden': False,
-    "$visibility": 'full',
-    'backupType': None,
-    'enabled': True,
-    'targetResourceId': None,
-    'maxBackupCount': 1,
-    'repeatInterval': 3600,
-    'repeatCount': 0,
-    'startTime': 0,
-    'endTime': 0,
-    'type': 'resourceBackupSchedule',
-    'revision': 0,
-}
 
 class BIMcloud():
 
@@ -174,15 +159,25 @@ class BackupManager():
 		"""
 		return b + round(f * (size/div ** e))
 
+	@staticmethod
+		"""	Adds timeout for the function. """
+	def run_with_timeout(fn, timeout, *args, **kwargs):
+		start_time = time.time()
+		while time.time() - start_time < timeout:
+			if fn(*args, **kwargs):
+				return fn(*args, **kwargs)
+			time.sleep(1)
+		return None
+
 	def backup(self, ids=[]) -> None:
-		"""	Starts resource backup procedure.
-		"""
+		"""	Starts resource backup procedure. """
 		i = 0
 		resources = self.get_resources(ids)
 		print (f"Found: {len(resources)}, starting backup process...")
 		for resource in resources:
 			i += 1
 			print (f"Resource #{i}: {resource['id']} ({resource['type']}: \"{resource['name']}\")")
+			timeout = self.get_timeout_from_filesize(resource['$size'])
 			# remove all schedules if required
 			schedules = self.client.get_resource_backup_schedules({'$eq': {'targetResourceId': resource['id']}})
 			if schedules and self.schedule_enabled == 'n':
@@ -193,8 +188,8 @@ class BackupManager():
 			# check backups
 			has_outdated_backup = True
 			backups = self.client.get_resource_backups([resource['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or []
-			if 	(backups and backups[0].get('$time') >= resource['$modifiedDate']) or \
-				(not backups and resource['$modifiedDate'] == resource['$uploadedTime']):
+			if 	(backups and backups[0].get('$time') >= resource.get('$modifiedDate')) or \
+				(not backups and resource.get('$modifiedDate') == resource.get('$uploadedTime')): # special for libs
 				has_outdated_backup = False
 
 			# create new, remove old
@@ -206,15 +201,16 @@ class BackupManager():
 						if b and b.get('$time') <= resource['$modifiedDate']:
 							project_delete_r = self.delete_project_backup(resource['id'], b['id'])
 							print (f"Delete: {b['id']} {project_delete_r}")
-					project_create_r = self.create_project_backup(resource)
-					is_valid = self.validate_project_backup(project_create_r, start_time)
-					if is_valid:
+					project_create_r = self.create_project_backup(resource['id'])
+					result = self.run_with_timeout(self.is_project_backup_created, timeout, project_create_r['id'])
+					if result and self.is_project_backup_valid(result, start_time):
 						print ('OK')
 
 				if resource['type'] == 'library':
 					# if backups and backups[0]['revision'] > resource['modifiedDate']
 					library_create_r = self.create_library_backup(resource, startTime = start_time + DELTA )
 					is_valid = self.validate_library_backup(resource['id'], library_create_r, start_time*1000)
+
 					if is_valid:
 						print ('OK')
 			else:
@@ -223,6 +219,7 @@ class BackupManager():
 			time.sleep(1)
 
 	def get_resources(self, ids=[]):
+		"""	Retrieves resources from bimcloud storage. """
 		params = { 'sort-by': '$time', 'sort-direction': 'desc' }
 		if ids:
 			return self.client.get_resources_by_id_list(ids, params)
@@ -236,57 +233,44 @@ class BackupManager():
 			params
 		)
 
-
-	def create_project_backup(self, resource):
-		"""	Creates a new backup for project resource.
-		Args:
-			resource_id (str): Resource id
-		Returns:
-			bool: True if process succeded
-		"""
+	def create_project_backup(self, resource_id):
+		"""	Creates a new backup for project resource. """
 		print (f"Creating a new backup")
-		start_time = time.time()
-		timeout = self.get_timeout_from_filesize(resource['$size'])
-		response, job = None, None
 		response = self.client.create_resource_backup(
-			resource['id'],
+			resource_id,
 			'bimproject',
 			'Scripted Backup'
 		)
-		if response and response.get('id'):
-			job = response
-			while job['status'] not in ['completed', 'failed']:
-				spent_time = round(time.time() - start_time)
-				print (f"> {job['status']}: {job['progress']['current']} / {job['progress']['max']} time passed: {spent_time} / {round(timeout)}\t",  end='\r')
-				if spent_time >= timeout:
-					print (f"\nTimeout exceeded!")
-					break
-				job = self.client.get_jobs(
-					criterion = {
-						'$and': [
-							{'$eq': {'jobType': 'createProjectBackup'}},
-							{'$eq': {'id': response['id']}}
-						]
-					}
-				)[0]
-				time.sleep(1)
+		if not response or not response.get('id'):
+			print("Failed to initiate backup.")
+			return None
+		return response
 
-		if job['status'] == 'completed':
-			print ('')
-			return job
+	def is_project_backup_created(self, job_id):
+		"""	Checks backup completion status. """
+		jobs = self.client.get_jobs(
+			criterion={
+				'$and': [
+					{'$eq': {'jobType': 'createProjectBackup'}},
+					{'$eq': {'id': job_id}}
+				]
+			},
+			params = {
+				'sort-by': '$time',
+				'sort-direction': 'desc'
+			}
+		)
+		if jobs:
+			job = jobs[0]
+			print(f"> {job['status']}: {job['progress']['current']} / {job['progress']['max']}", end='\r')
+			return job if job['status'] in ['completed', 'failed'] else None
 		return None
 
-	def validate_project_backup(self, job, start_time):
-		"""	Validates created backup by checking it's existing & props.
-		Args:
-			job (dict): Job dictionary object, after creation is launched
-			start_time (int): Timestamp of backup creation
-		Returns:
-			bool: True if validation succeded
-		"""
+	def is_project_backup_valid(self, job, start_time):
+		"""	Validates created backup by checking it's existing & props. """
 		if job:
 			resource_id = next(filter(lambda x: x['name'] == 'projectId', job['properties']), {}).get('value')
-			backup = self.client.get_resource_backups(
+			backups = self.client.get_resource_backups(
 				[resource_id],
 				criterion = {
 					'$and': [
@@ -298,21 +282,17 @@ class BackupManager():
 					'sort-by': '$time',
 					'sort-direction': 'desc'
 				}
-			)[0] or None
-			if backup and \
-				backup.get('$statusId') == '_server.backup.status.done' and \
-				backup.get('$fileSize') > 0:
-				return True
+			)
+			if backups:
+				backup = backups[0]
+				return (
+					backup.get('$statusId') == '_server.backup.status.done' and
+					backup.get('$fileSize', 0) > 0
+				)
 		return False
 
 	def delete_project_backup(self, resource_id, backup_id):
-		"""	Removes targeted backup.
-		Args:
-			resource_id (str): Resource (project) id
-			backup_id (str): Backup id
-		Returns:
-			bool: True if process succeded
-		"""
+		"""	Removes targeted backup. """
 		response = self.client.delete_resource_backup(resource_id, backup_id)
 		return response
 
@@ -397,7 +377,7 @@ if __name__ == "__main__":
 	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
 	cmd.add_argument('-u', '--user', required=True, help='User Login')
 	cmd.add_argument('-p', '--password', required=True, help='User Password')
-	cmd.add_argument('-s', '--schedule_enabled', required=False, help='Enable default schedules')
+	cmd.add_argument('-s', '--schedule_enabled', choices=['y', 'n'], default='n', help='Enable default schedules')
 	arg = cmd.parse_args()
 
 	try:
@@ -407,7 +387,7 @@ if __name__ == "__main__":
 			schedule_enabled = arg.schedule_enabled
 		)
 
-		bcp = manager.backup(['4292A87F-BD20-4D54-B377-55F93D3AE202'])
+		bcp = manager.backup(['386A2B91-1C09-42EC-9078-0220BC1B96EA'])
 
 		# print (bm.get_timeout_from_filesize(1000*1000*1000*3))
 
