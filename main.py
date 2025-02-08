@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 class BIMcloud():
 
 	def __init__(self, manager: str, client: str, user: str, password: str, **params):
+		self.log = logging.getLogger("BackupManager")
 		self.manager = manager
 		self.client = client
 		self.user = user
@@ -33,11 +34,12 @@ class BIMcloud():
 		try:
 			response = requests.post(url, data=request, headers={'Content-Type': 'application/x-www-form-urlencoded'})
 			response.raise_for_status()
-			result = response.json() if json else response.content
+			result = response.json()
 			self.auth = result
 			self.auth_header = {'Authorization': f"Bearer {result['access_token']}"}
-		except:
-			raise
+		except Exception as e:
+			self.log.error(f"Unexpected error: {e}", exc_info=True)
+			sys.exit(1)
 
 	def _grant(self):
 		try:
@@ -46,8 +48,9 @@ class BIMcloud():
 			session = self.create_session(self.user, ticket)
 			if session:
 				self.session = session
-		except:
-			raise
+		except Exception as e:
+			self.log.error(f"Unexpected error: {e}", exc_info=True)
+			sys.exit(1)
 
 	def create_session(self, username, ticket):
 		request = {
@@ -79,6 +82,7 @@ class BIMcloud():
 		return response
 
 	def get_jobs(self, criterion={}, params={}):
+		params = params or {}
 		url = self.manager + '/management/client/get-jobs-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
 		return response.json()
@@ -148,7 +152,7 @@ class LogHandler(logging.StreamHandler):
 			msg = self.format(record)
 			if msg.endswith('<rf>'):
 				msg = msg.replace('<rf>', '')
-				sys.stdout.write(f"\r{msg}")
+				sys.stdout.write(f"\r{msg}".ljust(120) + '\r')
 				sys.stdout.flush()
 			else:
 				sys.stdout.write(f"{msg}\n")
@@ -158,17 +162,8 @@ class LogHandler(logging.StreamHandler):
 class BackupManager():
 
 	def __init__(self, client, **parameters):
-		print (f"{datetime.now().strftime('%d.%M.%y %H:%M:%S')} [INIT] Initializing backup manager for {client.manager}...")
-		self.log = logging.getLogger(self.__class__.__name__)
-		self.log.setLevel(logging.INFO)
-		handler = LogHandler()
-		formatter = logging.Formatter(
-			'%(asctime)s [%(levelname)s] %(message)s',
-			datefmt='%d.%M.%y %H:%M:%S'
-		)
-		handler.setFormatter(formatter)
-		self.log.addHandler(handler)
-
+		self.log = logging.getLogger('BackupManager')
+		self.log.info(f"Initializing backup manager for {client.manager}")
 		self.client = client
 		self.schedule_enabled = parameters.get('schedule_enabled')
 
@@ -186,18 +181,13 @@ class BackupManager():
 	def run_with_timeout(self, fn, timeout, delay, *args, **kwargs):
 		"""	Adds timeout for the function. """
 		start_time = time.time()
-		runtime = 0
-		while runtime < timeout:
-			runtime = time.time() - start_time
-			kwargs['runtime'] = runtime
-			kwargs['timeout'] = timeout
-			result = fn(*args, **kwargs)
-			if result:
+		while (runtime := time.time() - start_time) < timeout:
+			kwargs.update({"runtime": runtime, "timeout": timeout})
+			if result := fn(*args, **kwargs):
 				return result
 			time.sleep(delay)
-		if runtime >= timeout:
-			print ('', flush=True)
-			self.log.error(f"Process timed out! Skipped.")
+		print ('', flush=True)
+		self.log.error(f"Process timed out! Skipped.")
 		return None
 
 	def backup(self, ids=[]) -> None:
@@ -289,7 +279,10 @@ class BackupManager():
 		)
 		if jobs:
 			job = jobs[0]
-			self.log.info(f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec\t<rf>")
+			self.log.info(
+			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, "
+			    f"(runtime: {round(kwargs.get('runtime'), 0)}/{round(kwargs.get('timeout'), 0)} sec)<rf>"
+			)
 			if job['status'] in ['completed', 'failed']:
 				print ('', flush=True)
 				return job
@@ -298,7 +291,8 @@ class BackupManager():
 	def is_project_backup_valid(self, job, start_time):
 		"""	Validates created backup by checking it's existing & props. """
 		if job:
-			resource_id = next(filter(lambda x: x['name'] == 'projectId', job['properties']), {}).get('value')
+			# resource_id = next((x['value'] for x in job.get('properties', []) if x.get('name') == 'projectId'), None)
+			resource_id = next((x.get('value') for x in (job.get('properties') or []) if x.get('name') == 'projectId'), None)
 			backups = self.client.get_resource_backups(
 				[resource_id],
 				criterion = {
@@ -360,7 +354,7 @@ class BackupManager():
 				'sort-direction': 'desc'
 			}
 		)
-		self.log.info(f"> awaiting auto backup, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec\t<rf>")
+		self.log.info(f"> awaiting auto backup, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec<rf>")
 		if backups:
 			backup = backups[0]
 			# return backup if backup.get('$time') >= action_time else None
@@ -400,12 +394,18 @@ class BackupManager():
 				schedule_delete_r = self.client.delete_resource_backup_schedule(s['id'])
 			self.log.info(f"Deleted: {len(schedules)} schedules, {schedule_delete_r}")
 			return schedule_delete_r
-		return None
 
 
 if __name__ == "__main__":
 
 	start_time = time.time()
+
+	logger = logging.getLogger('BackupManager')
+	logger.setLevel(logging.INFO)
+	handler = LogHandler()
+	formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%d.%M.%y %H:%M:%S')
+	handler.setFormatter(formatter)
+	logger.addHandler(handler)
 
 	cmd = argparse.ArgumentParser()
 	cmd.add_argument('-m', '--manager', required=True, help='URL of the BIMcloud Manager')
@@ -417,13 +417,11 @@ if __name__ == "__main__":
 
 	try:
 		cloud = BIMcloud(**vars(arg))
-		manager = BackupManager(
-			cloud,
-			schedule_enabled = arg.schedule_enabled
-		)
-		backup = manager.backup(['9469F25B-D6DD-4CC3-8026-B85AC8338A16', 'F060F5F3-A8F2-4A61-964E-CAF0EDA8493C', 'D59FAB40-DB74-4835-A624-A90A052B64DB'])
-
-	except:
-		raise
-
-	print (f"{datetime.now().strftime('%d.%M.%y %H:%M:%S')} [INFO] Completed in {round(time.time()-start_time)} sec")
+		if cloud:
+			manager = BackupManager(cloud, schedule_enabled = arg.schedule_enabled)
+			backup = manager.backup() # all
+	except Exception as e:
+		logger.error(f"Unexpected error: {e}", exc_info=True)
+		sys.exit(1)
+	finally:
+		logger.info(f"Finished in {round(time.time()-start_time)} sec")
