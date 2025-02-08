@@ -145,19 +145,6 @@ class BIMcloud():
 		response = requests.post(url, headers=self.auth_header, json=schedule)
 		return response
 
-class LogHandler(logging.StreamHandler):
-	""" Custom log handler to overwrite some output methods. """
-	def emit(self, record):
-		try:
-			msg = self.format(record)
-			if msg.endswith('<rf>'):
-				msg = msg.replace('<rf>', '')
-				sys.stdout.write(f"\r{msg}".ljust(120) + '\r')
-				sys.stdout.flush()
-			else:
-				sys.stdout.write(f"{msg}\n")
-		except Exception:
-			self.handleError(record)
 
 class BackupManager():
 
@@ -187,7 +174,7 @@ class BackupManager():
 				return result
 			time.sleep(delay)
 		print ('', flush=True)
-		self.log.error(f"Process timed out! Skipped.")
+		self.log.error(f"Process timed out! Skipped. ({fn.__name__} {args})")
 		return None
 
 	def backup(self, ids=[]) -> None:
@@ -199,7 +186,7 @@ class BackupManager():
 		for resource in resources:
 			i += 1
 			self.log.info(f"Resource #{i}:")
-			self.log.info(f"{resource['id']} ({resource['type']}: \"{resource['name']}\")")
+			self.log.info(f"{resource['id']} ({resource['type']}: \"{resource['name']}\", {round(resource['$size']/1024 **2, 2)} Mb)")
 			timeout = self.get_timeout_from_filesize(resource['$size'])
 			# remove all schedules if required
 			if self.schedule_enabled == 'n':
@@ -280,8 +267,7 @@ class BackupManager():
 		if jobs:
 			job = jobs[0]
 			self.log.info(
-			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, "
-			    f"(runtime: {round(kwargs.get('runtime'), 0)}/{round(kwargs.get('timeout'), 0)} sec)<rf>"
+			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'), 0)}/{round(kwargs.get('timeout'), 0)} sec)<rf>"
 			)
 			if job['status'] in ['completed', 'failed']:
 				print ('', flush=True)
@@ -337,6 +323,7 @@ class BackupManager():
 		if response:
 			self.log.info(f"Inserted, expecting scheduler to create backup")
 			return response
+		self.log.error(f"Failed to insert backup schedule: {resource_id}")
 		return None
 
 	def is_library_backup_created(self, resource_id, action_time, **kwargs):
@@ -400,20 +387,46 @@ if __name__ == "__main__":
 
 	start_time = time.time()
 
-	logger = logging.getLogger('BackupManager')
-	logger.setLevel(logging.INFO)
-	handler = LogHandler()
-	formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%d.%M.%y %H:%M:%S')
-	handler.setFormatter(formatter)
-	logger.addHandler(handler)
-
+	# get inputs
 	cmd = argparse.ArgumentParser()
 	cmd.add_argument('-m', '--manager', required=True, help='URL of the BIMcloud Manager')
 	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
 	cmd.add_argument('-u', '--user', required=True, help='User Login')
 	cmd.add_argument('-p', '--password', required=True, help='User Password')
 	cmd.add_argument('-s', '--schedule_enabled', choices=['y', 'n'], default='n', help='Enable default schedules')
+	cmd.add_argument('-f', '--filepath', required=False, help='Path to the log file')
 	arg = cmd.parse_args()
+
+	# setup logging
+	class LogHandler(logging.StreamHandler):
+		""" Custom log handler to overwrite some output methods. """
+		def emit(self, record):
+			try:
+				msg = self.format(record)
+				if msg.endswith('<rf>'):
+					msg = msg.replace('<rf>', '')
+					sys.stdout.write(f"\r{msg}".ljust(120) + '\r')
+					sys.stdout.flush()
+				else:
+					sys.stdout.write(f"{msg}\n")
+			except Exception:
+				self.handleError(record)
+
+	logger = logging.getLogger('BackupManager')
+	logger.setLevel(logging.DEBUG)
+	formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%d.%M.%y %H:%M:%S')
+
+	handler_console = LogHandler(logging.StreamHandler(sys.stdout))
+	handler_console.setFormatter(formatter)
+	handler_console.setLevel(logging.INFO)
+
+	handler_file = LogHandler
+	handler_file = logging.FileHandler(arg.filepath, mode='a')
+	handler_file.setFormatter(formatter)
+	handler_file.setLevel(logging.WARNING)
+
+	logger.addHandler(handler_console)
+	logger.addHandler(handler_file)
 
 	try:
 		cloud = BIMcloud(**vars(arg))
