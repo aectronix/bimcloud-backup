@@ -14,6 +14,7 @@ class BackupManager():
 		self.log.info(f"Initializing backup manager for {client.manager}")
 		self.log.info(f"Initializing storage connection with {storage.service._baseUrl}")
 		self.client = client
+		self.storage = storage
 		self.schedule_enabled = parameters.get('schedule_enabled')
 
 	@staticmethod
@@ -70,8 +71,10 @@ class BackupManager():
 								self.log.info(f"Deleted: {len(backups)} backups, {delete_backup_r}")
 						project_create_r = self.create_project_backup(resource['id'])
 						result = self.run_with_timeout(self.is_project_backup_created, timeout, 1, project_create_r['id'])
-						if result and self.is_project_backup_valid(result, start_time):
-							self.log.info(f"Backup successfully created.")
+						backup_new = self.is_project_backup_valid(result, start_time)
+						if backup_new:
+							self.log.info(f"Backup successfully created. ({backup_new['id']})")
+							self.transfer_backup(resource['name'], resource['id'], resource['$size'], backup_new['id'])
 					# lib
 					if resource['type'] == 'library':
 						library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
@@ -132,7 +135,7 @@ class BackupManager():
 		if jobs:
 			job = jobs[0]
 			self.log.info(
-			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'), 0)}/{round(kwargs.get('timeout'), 0)} sec)<rf>"
+			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>"
 			)
 			if job['status'] in ['completed', 'failed']:
 				print ('', flush=True)
@@ -142,7 +145,6 @@ class BackupManager():
 	def is_project_backup_valid(self, job, start_time):
 		"""	Validates created backup by checking it's existing & props. """
 		if job:
-			# resource_id = next((x['value'] for x in job.get('properties', []) if x.get('name') == 'projectId'), None)
 			resource_id = next((x.get('value') for x in (job.get('properties') or []) if x.get('name') == 'projectId'), None)
 			backups = self.client.get_resource_backups(
 				[resource_id],
@@ -159,11 +161,9 @@ class BackupManager():
 			)
 			if backups:
 				backup = backups[0]
-				return (
-					backup.get('$statusId') == '_server.backup.status.done' and
-					backup.get('$fileSize', 0) > 0
-				)
-		return False
+				if backup.get('$statusId') == '_server.backup.status.done' and backup.get('$fileSize', 0) > 0:
+					return backup
+		return None
 
 	def delete_project_backup(self, resource_id, backup_id):
 		"""	Removes targeted backup. """
@@ -247,6 +247,28 @@ class BackupManager():
 			self.log.info(f"Deleted: {len(schedules)} schedules, {schedule_delete_r}")
 			return schedule_delete_r
 
+	def transfer_backup(self, resource_name, resource_id, resource_size, backup_id):
+		self.log.info(f"Transferring to the cloud storage...")
+		data = self.client.download_backup(resource_id, backup_id)
+		files = self.storage.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
+		if not files:
+			logger.error(f"Cannot retreive storage folder: {e}", exc_info=True)
+			sys.exit(1)
+		if data:
+			match_file = next((f for f in files if f['name'] == resource_name+'.BIMProject25'), None)
+			match_file_id = match_file['id'] if match_file else None
+			request = self.storage.prepare_upload(
+				data, 
+				file_name = resource_name+'.BIMProject25',
+				file_id = match_file_id,
+				resource_id = resource_id
+			)
+			timeout = self.get_timeout_from_filesize(resource_size, e=1.35) # adjusting for google
+			result = self.run_with_timeout(self.storage.upload_chunks, timeout, 1, request=request)
+			if result:
+				self.log.info(f"Backup successfully uploaded.")
+		else:
+			self.log.error(f"Failed to retrieve backup data ({resource_id})")
 
 if __name__ == "__main__":
 
@@ -303,7 +325,8 @@ if __name__ == "__main__":
 			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
 			backup = manager.backup(arg.resource) # all
 
-			files = drive.get_files()
+			# files = drive.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
+			# upload = drive.upload('backup.BIMProject25', 'C:\\Users\\i.yurasov\\Desktop\\dev\\backup.BIMProject25', '1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
 
 	except Exception as e:
 		logger.error(f"Unexpected error: {e}", exc_info=True)

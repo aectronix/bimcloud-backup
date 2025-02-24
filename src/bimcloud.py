@@ -33,14 +33,15 @@ class BIMcloudAPI():
 			self.auth = result
 			self.auth_header = {'Authorization': f"Bearer {result['access_token']}"}
 		except Exception as e:
-			self.log.error(f"Unexpected error: {e}", exc_info=True)
+			self.log.error(f"Auth error: {e}", exc_info=True)
 			sys.exit(1)
 
 	def _grant(self):
 		try:
 			servers = self.get_model_servers()
 			ticket = self.get_ticket(servers[0]['id'])
-			session = self.create_session(self.user, ticket)
+			session = self.create_session2(self.user, self.password, self.client)
+			print (session)
 			if session:
 				self.session = session
 		except Exception as e:
@@ -60,6 +61,16 @@ class BIMcloudAPI():
 		response = requests.post(url, json=request, headers={'content-type': request['data-content-type']})
 		result = response.json()
 		return result['data']
+
+	def create_session2(self, username, password, client_id):
+		request = {
+			'username': username,
+			'password': password,
+			'client-id': client_id
+		}
+		url = self.manager + '/management/latest/create-session'
+		response = requests.post(url, json=request)
+		return response.json()
 
 	def create_resource_backup(self, resource_id, backup_type, backup_name):
 		url = self.manager + '/management/latest/create-resource-backup'
@@ -81,6 +92,11 @@ class BIMcloudAPI():
 		url = self.manager + '/management/client/get-jobs-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
 		return response.json()
+
+	def download_backup(self, resource_id, backup_id):
+		url = self.manager + '/management/client/download-backup'
+		response = requests.get(url, params={'session-id': self.session['session-id'], 'resource-id': resource_id, 'backup-id': backup_id})
+		return response.content
 
 	def get_model_servers(self):
 		url = self.manager + '/management/client/get-model-servers'
