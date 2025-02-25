@@ -93,9 +93,9 @@ class BIMcloudAPI():
 		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
 		return response.json()
 
-	def download_backup(self, resource_id, backup_id):
+	def download_backup(self, resource_id, backup_id, timeout=60):
 		url = self.manager + '/management/client/download-backup'
-		response = requests.get(url, params={'session-id': self.session['session-id'], 'resource-id': resource_id, 'backup-id': backup_id})
+		response = requests.get(url, params={'session-id': self.session['session-id'], 'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout)
 		return response.content
 
 	def get_model_servers(self):

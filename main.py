@@ -1,6 +1,8 @@
 import argparse
+import gc
 import logging
 import math
+import multiprocessing
 import sys
 import time
 
@@ -39,6 +41,33 @@ class BackupManager():
 		print ('', flush=True)
 		self.log.error(f"Process timed out! Skipped. ({fn.__name__} {args})")
 		return None
+
+	def isolate_with_timeout(self, fn, timeout, delay, message='processing', *args, **kwargs):
+		start_time = time.time()
+		queue = multiprocessing.Queue()
+		p = multiprocessing.Process(target=fn, args=(queue, *args), kwargs=kwargs)
+		p.daemon = True
+		p.start()
+		while p.is_alive() and (runtime := time.time() - start_time) < timeout:
+			kwargs.update({"runtime": runtime, "timeout": timeout})
+			self.log.info(f"> {message}, runtime: {round(runtime)}/{timeout} sec<rf>")
+			if not queue.empty():
+				result = queue.get()
+				p.join()
+				print ('', flush=True)
+				return result
+			time.sleep(delay)
+
+		if p.is_alive():
+			p.terminate()
+			p.join()
+			self.log.error(f"Process timed out! Skipped. ({fn.__name__} {args})")
+			return None
+
+		p.join()
+		result = queue.get() if not queue.empty() else None
+		print ('', flush=True)
+		return result
 
 	def backup(self, ids=[]) -> None:
 		"""	Starts resource backup procedure. """
@@ -87,6 +116,9 @@ class BackupManager():
 				# don't hurry up
 				time.sleep(1)
 
+				del resource
+				gc.collect()
+
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
 		params = { 'sort-by': '$time', 'sort-direction': 'desc' }
@@ -133,6 +165,7 @@ class BackupManager():
 			}
 		)
 		if jobs:
+			time.sleep(1)
 			job = jobs[0]
 			self.log.info(
 			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>"
@@ -209,7 +242,6 @@ class BackupManager():
 		self.log.info(f"> awaiting auto backup, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec<rf>")
 		if backups:
 			backup = backups[0]
-			# return backup if backup.get('$time') >= action_time else None
 			if backup.get('$time') >= action_time:
 				print ('', flush=True)
 				return backup
@@ -247,28 +279,37 @@ class BackupManager():
 			self.log.info(f"Deleted: {len(schedules)} schedules, {schedule_delete_r}")
 			return schedule_delete_r
 
+	def get_backup_data(self, queue, resource_id, backup_id, **kwargs):
+		try:
+			result = self.client.download_backup(resource_id, backup_id, kwargs.get('timeout'))
+			queue.put(result)
+		except Exception as e:
+			queue.put(e)
+
 	def transfer_backup(self, resource_name, resource_id, resource_size, backup_id):
-		self.log.info(f"Transferring to the cloud storage...")
-		data = self.client.download_backup(resource_id, backup_id)
+		self.log.info(f"Get contents and save to the cloud...")
+		timeout = self.get_timeout_from_filesize(resource_size, e=1.30) # adjusting for google
+		data = self.isolate_with_timeout(self.get_backup_data, timeout=timeout, delay=1, message='receiving', resource_id=resource_id, backup_id=backup_id)
+		if not data:
+			logger.error(f"Failed to retreive backup data! Skipped.")
+			return None
+
 		files = self.storage.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
-		if not files:
-			logger.error(f"Cannot retreive storage folder: {e}", exc_info=True)
-			sys.exit(1)
-		if data:
-			match_file = next((f for f in files if f['name'] == resource_name+'.BIMProject25'), None)
-			match_file_id = match_file['id'] if match_file else None
-			request = self.storage.prepare_upload(
-				data, 
-				file_name = resource_name+'.BIMProject25',
-				file_id = match_file_id,
-				resource_id = resource_id
-			)
-			timeout = self.get_timeout_from_filesize(resource_size, e=1.35) # adjusting for google
-			result = self.run_with_timeout(self.storage.upload_chunks, timeout, 1, request=request)
-			if result:
-				self.log.info(f"Backup successfully uploaded.")
-		else:
-			self.log.error(f"Failed to retrieve backup data ({resource_id})")
+		match_file = next((f for f in files if f['name'] == resource_name+'.BIMProject25'), None)
+		match_file_id = match_file['id'] if match_file else None
+		request = self.storage.prepare_upload(
+			data,
+			file_name = resource_name+'.BIMProject25',
+			file_id = match_file_id,
+			resource_id = resource_id
+		)
+		upload = self.isolate_with_timeout(self.storage.execute_request, timeout=timeout, delay=1, message='uploading', request=request)
+		if upload:
+			self.log.info(f"Successfully uploaded to the cloud. ({upload['id']})")
+
+		del data
+		gc.collect()
+
 
 if __name__ == "__main__":
 
@@ -323,10 +364,7 @@ if __name__ == "__main__":
 		drive = GoogleDriveAPI(arg.gd_cred_path, arg.client)
 		if cloud and drive:
 			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
-			backup = manager.backup(arg.resource) # all
-
-			# files = drive.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
-			# upload = drive.upload('backup.BIMProject25', 'C:\\Users\\i.yurasov\\Desktop\\dev\\backup.BIMProject25', '1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
+			backup = manager.backup(arg.resource)
 
 	except Exception as e:
 		logger.error(f"Unexpected error: {e}", exc_info=True)
