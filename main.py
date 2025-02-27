@@ -2,7 +2,6 @@ import argparse
 import gc
 import logging
 import math
-import multiprocessing
 import sys
 import time
 
@@ -13,8 +12,6 @@ class BackupManager():
 
 	def __init__(self, client, storage, **parameters):
 		self.log = logging.getLogger('BackupManager')
-		self.log.info(f"Initializing backup manager for {client.manager}")
-		self.log.info(f"Initializing storage connection with {storage.service._baseUrl}")
 		self.client = client
 		self.storage = storage
 		self.schedule_enabled = parameters.get('schedule_enabled')
@@ -42,39 +39,12 @@ class BackupManager():
 		self.log.error(f"Process timed out! Skipped. ({fn.__name__} {args})")
 		return None
 
-	def isolate_with_timeout(self, fn, timeout, delay, message='processing', *args, **kwargs):
-		start_time = time.time()
-		queue = multiprocessing.Queue()
-		p = multiprocessing.Process(target=fn, args=(queue, *args), kwargs=kwargs)
-		p.daemon = True
-		p.start()
-		while p.is_alive() and (runtime := time.time() - start_time) < timeout:
-			kwargs.update({"runtime": runtime, "timeout": timeout})
-			self.log.info(f"> {message}, runtime: {round(runtime)}/{timeout} sec<rf>")
-			if not queue.empty():
-				result = queue.get()
-				p.join()
-				print ('', flush=True)
-				return result
-			time.sleep(delay)
-
-		if p.is_alive():
-			p.terminate()
-			p.join()
-			self.log.error(f"Process timed out! Skipped. ({fn.__name__} {args})")
-			return None
-
-		p.join()
-		result = queue.get() if not queue.empty() else None
-		print ('', flush=True)
-		return result
-
 	def backup(self, ids=[]) -> None:
 		"""	Starts resource backup procedure. """
 		i = 0
 		resources = self.get_resources(ids)
 		if resources:
-			self.log.info(f"Resources: {len(resources)}, starting backup process...")
+			self.log.info(f"Found resources: {len(resources)}, starting backup process...")
 			for resource in resources:
 				i += 1
 				self.log.info(f"Resource #{i}:")
@@ -92,7 +62,7 @@ class BackupManager():
 				# create new, remove old
 				if has_outdated_backup:
 					start_time = time.time()
-					# prj
+
 					if resource['type'] == 'project':
 						for b in backups:
 							if b and b.get('$time') <= resource['$modifiedDate']:
@@ -104,7 +74,7 @@ class BackupManager():
 						if backup_new:
 							self.log.info(f"Backup successfully created. ({backup_new['id']})")
 							self.transfer_backup(resource['name'], resource['id'], resource['$size'], backup_new['id'])
-					# lib
+
 					if resource['type'] == 'library':
 						library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
 						result = self.run_with_timeout(self.is_library_backup_created, timeout, 1, resource['id'], start_time)
@@ -118,6 +88,8 @@ class BackupManager():
 
 				del resource
 				gc.collect()
+
+				self.client.refresh()
 
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
@@ -164,9 +136,8 @@ class BackupManager():
 				'sort-direction': 'desc'
 			}
 		)
-		if jobs:
-			time.sleep(1)
-			job = jobs[0]
+		if jobs and not isinstance(jobs, str):
+			job = jobs.json()[0]
 			self.log.info(
 			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>"
 			)
@@ -272,28 +243,55 @@ class BackupManager():
 		return False
 
 	def delete_resource_schedules(self, resource_id):
+		schedule_delete_r = None
 		schedules = self.client.get_resource_backup_schedules({'$eq': {'targetResourceId': resource_id}})
 		if schedules:
+			print (schedules)
 			for s in schedules:
-				schedule_delete_r = self.client.delete_resource_backup_schedule(s['id'])
-			self.log.info(f"Deleted: {len(schedules)} schedules, {schedule_delete_r}")
-			return schedule_delete_r
+				print (s)
+				if s and not isinstance(s, str):
+					schedule_delete_r = self.client.delete_resource_backup_schedule(s['id'])
+			self.log.info(f"Deleted: {len(schedules)} schedules")
+			if schedule_delete_r:
+				return schedule_delete_r
+			return None
 
-	def get_backup_data(self, queue, resource_id, backup_id, **kwargs):
-		try:
-			result = self.client.download_backup(resource_id, backup_id, kwargs.get('timeout'))
-			queue.put(result)
-		except Exception as e:
-			queue.put(e)
+	def get_backup_data(self, resource_id, backup_id, timeout=300):
+		with self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True) as response:
+			response.raise_for_status()
+			total_length = response.headers.get('content-length')
+			if total_length is not None:
+				total_length = int(total_length)
+			downloaded = 0
+			chunks = []
+			start_time = time.time()
+			last_update = start_time
+
+			for chunk in response.iter_content(chunk_size=4096):
+				if chunk:
+					chunks.append(chunk)
+					downloaded += len(chunk)
+					now = time.time()
+					runtime = now - start_time
+					if runtime > timeout:
+						self.log.error(f"timeout!")
+						return None
+					if now - last_update >= 1:
+						self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+						last_update = now
+			content = b''.join(chunks)
+			self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+			print ('', flush=True)
+		return content
 
 	def transfer_backup(self, resource_name, resource_id, resource_size, backup_id):
 		self.log.info(f"Get contents and save to the cloud...")
 		timeout = self.get_timeout_from_filesize(resource_size, e=1.30) # adjusting for google
-		data = self.isolate_with_timeout(self.get_backup_data, timeout=timeout, delay=1, message='receiving', resource_id=resource_id, backup_id=backup_id)
+		# data = self.isolate_with_timeout(self.get_backup_data, timeout=timeout, delay=1, message='receiving', resource_id=resource_id, backup_id=backup_id)
+		data = self.get_backup_data(resource_id, backup_id, timeout)
 		if not data:
 			logger.error(f"Failed to retreive backup data! Skipped.")
 			return None
-
 		files = self.storage.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
 		match_file = next((f for f in files if f['name'] == resource_name+'.BIMProject25'), None)
 		match_file_id = match_file['id'] if match_file else None
@@ -303,7 +301,7 @@ class BackupManager():
 			file_id = match_file_id,
 			resource_id = resource_id
 		)
-		upload = self.isolate_with_timeout(self.storage.execute_request, timeout=timeout, delay=1, message='uploading', request=request)
+		upload = self.run_with_timeout(self.storage.upload_chunks, timeout, 0.05, request)
 		if upload:
 			self.log.info(f"Successfully uploaded to the cloud. ({upload['id']})")
 

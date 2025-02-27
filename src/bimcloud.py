@@ -3,6 +3,8 @@ import logging
 import requests
 import sys
 
+from urllib3.util.retry import Retry
+
 class BIMcloudAPI():
 
 	def __init__(self, manager: str, client: str, user: str, password: str, **params):
@@ -15,10 +17,9 @@ class BIMcloudAPI():
 		self.auth_header = None
 		self.session = None
 
-		self._authorize()
-		self._grant()
+		self.authorize()
 
-	def _authorize(self):
+	def authorize(self, refresh=False):
 		url = self.manager + '/management/client/oauth2/token'
 		request = {
 			'grant_type': 'password',
@@ -26,43 +27,38 @@ class BIMcloudAPI():
 			'password': self.password,
 			'client_id': self.client
 		}
+
+		retry_strategy = Retry(
+			total=1,
+			backoff_factor=1,
+			status_forcelist=[429, 430, 500, 502, 503, 504],
+			allowed_methods=['GET', 'POST']
+		)
+		adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
+		session = requests.Session()
+		session.mount("https://", adapter)
+		session.mount("http://", adapter)
+
 		try:
-			response = requests.post(url, data=request, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+			response = session.post(url, data=request, headers={'Content-Type': 'application/x-www-form-urlencoded'}, timeout=30)
 			response.raise_for_status()
 			result = response.json()
-			self.auth = result
-			self.auth_header = {'Authorization': f"Bearer {result['access_token']}"}
+			if result and result.get('access_token'):
+				self.auth = result
+				self.auth_header = {'Authorization': f"Bearer {result['access_token']}"}
+			auth_session = self.create_session(self.user, self.password, self.client)
+			if auth_session and auth_session.get('session-id'):
+				self.session = auth_session
+			if not refresh:
+				self.log.info(f"BIM cloud initialized: {self.manager} ({self.user})")
 		except Exception as e:
 			self.log.error(f"Auth error: {e}", exc_info=True)
 			sys.exit(1)
 
-	def _grant(self):
-		try:
-			servers = self.get_model_servers()
-			ticket = self.get_ticket(servers[0]['id'])
-			session = self.create_session2(self.user, self.password, self.client)
-			print (session)
-			if session:
-				self.session = session
-		except Exception as e:
-			self.log.error(f"Unexpected error: {e}", exc_info=True)
-			sys.exit(1)
+	def refresh(self):
+		self.authorize(refresh=True)
 
-	def create_session(self, username, ticket):
-		request = {
-			'data-content-type': 'application/vnd.graphisoft.teamwork.session-service-1.0.authentication-request-1.0+json',
-			'data': {
-				'username': username,
-				'ticket': ticket
-			}
-		}
-		# switch to XX001 server port
-		url = self.manager[:-1] + '1' + '/session-service/1.0/create-session'
-		response = requests.post(url, json=request, headers={'content-type': request['data-content-type']})
-		result = response.json()
-		return result['data']
-
-	def create_session2(self, username, password, client_id):
+	def create_session(self, username, password, client_id):
 		request = {
 			'username': username,
 			'password': password,
@@ -91,17 +87,12 @@ class BIMcloudAPI():
 		params = params or {}
 		url = self.manager + '/management/client/get-jobs-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
-		return response.json()
+		return response
 
-	def download_backup(self, resource_id, backup_id, timeout=60):
+	def download_backup(self, resource_id, backup_id, timeout=300, stream=False):
 		url = self.manager + '/management/client/download-backup'
-		response = requests.get(url, params={'session-id': self.session['session-id'], 'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout)
-		return response.content
-
-	def get_model_servers(self):
-		url = self.manager + '/management/client/get-model-servers'
-		response = requests.get(url, headers=self.auth_header)
-		return response.json()
+		response = requests.get(url, params={'session-id': self.session['session-id'], 'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout, stream=stream)
+		return response 
 
 	def get_resources_by_criterion(self, criterion={}, params={}):
 		url = self.manager + '/management/client/get-resources-by-criterion'
@@ -122,16 +113,6 @@ class BIMcloudAPI():
 		url = self.manager + '/management/client/get-resource-backup-schedules-by-criterion'
 		response = requests.post(url, headers=self.auth_header, params={}, json=criterion)
 		return response.json()
-
-	def get_ticket(self, server_id):
-		url = self.manager + '/management/latest/ticket-generator/get-ticket'
-		payload = {
-			'type': 'freeTicket',
-			'resources': [server_id],
-			'format': 'base64'
-		}
-		response = requests.post(url, headers=self.auth_header, json=payload)
-		return response.content.decode('utf-8')
 
 	def insert_resource_backup_schedule(
 			self,

@@ -18,15 +18,18 @@ class GoogleDriveAPI():
         ]
         self.service = None
 
-        self._authorize(cred_path, account)
+        self.authorize(cred_path, account)
 
-    def _authorize(self, cred_path, account):
+    def authorize(self, cred_path, account):
         try:
             credentials = service_account.Credentials.from_service_account_file(
                 cred_path,
                 scopes = self.scopes
             ).with_subject(account)
-            self.service = build('drive', 'v3', credentials=credentials)
+            service = build('drive', 'v3', credentials=credentials)
+            if service:
+                self.service = service
+                self.log.info(f"Cloud storage initialized: {service._baseUrl} ({account.split('@')[0]})")
         except Exception as e:
             self.log.error(f"Auth Error: {e}", exc_info=True)
             sys.exit(1)
@@ -60,6 +63,8 @@ class GoogleDriveAPI():
         media = MediaIoBaseUpload(
             file_stream,
             mimetype = 'application/octet-stream',
+            chunksize = 1024*1024*5, # max
+            resumable = True
         )
         params = {
             'body': file_metadata,
@@ -74,3 +79,12 @@ class GoogleDriveAPI():
             request = self.service.files().create(**params)
         return request
 
+    def upload_chunks(self, request, **kwargs):
+        response = None
+        status, response = request.next_chunk()
+        if status:
+            self.log.info(f"> uploading: {int(status.progress() * 100)}%, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec<rf>")
+        if response:
+            self.log.info(f"> uploaded: 100%, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec<rf>")
+            print ('', flush=True)
+        return response
