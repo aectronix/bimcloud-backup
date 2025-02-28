@@ -72,15 +72,17 @@ class BackupManager():
 						result = self.run_with_timeout(self.is_project_backup_created, timeout, 1, project_create_r['id'])
 						backup_new = self.is_project_backup_valid(result, start_time)
 						if backup_new:
-							self.log.info(f"Backup successfully created. ({backup_new['id']})")
+							self.log.info(f"Backup successfully created.")
 							self.transfer_backup(resource['name'], resource['id'], resource['$size'], backup_new['id'])
 
 					if resource['type'] == 'library':
 						library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
 						result = self.run_with_timeout(self.is_library_backup_created, timeout, 1, resource['id'], start_time)
 						schedule_delete_r = self.delete_resource_schedules(resource['id'])
-						if result and self.is_library_backup_valid(resource['id'], result['id'], start_time):
+						backup_new = self.is_library_backup_valid(resource['id'], result['id'], start_time)
+						if backup_new:
 							self.log.info(f"Backup successfully created.")
+							self.transfer_backup(resource['name'], resource['id'], resource['$size'], backup_new['id'])
 				else:
 					self.log.info(f"Resource has valid backup, skipped")
 				# don't hurry up
@@ -89,7 +91,8 @@ class BackupManager():
 				del resource
 				gc.collect()
 
-				self.client.refresh()
+				# self.client._create_or_refresh_auth_token()
+				# self.client._create_or_refresh_session()
 
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
@@ -240,6 +243,8 @@ class BackupManager():
 				backup.get('$statusId') == '_server.backup.status.done' and
 				backup.get('$fileSize', 0) > 0
 			)
+			if backup.get('id') == backup_id and backup.get('$statusId') == '_server.backup.status.done' and backup.get('$fileSize', 0) > 0:
+				return backup
 		return False
 
 	def delete_resource_schedules(self, resource_id):
@@ -326,7 +331,6 @@ if __name__ == "__main__":
 	cmd.add_argument('-k', '--gd_cred_path', required=True, help='Path to Gogole credentials')
 	arg = cmd.parse_args()
 
-	# setup logging
 	class LogHandler(logging.StreamHandler):
 		""" Custom log handler to overwrite some output methods. """
 		def emit(self, record):
@@ -363,9 +367,12 @@ if __name__ == "__main__":
 		if cloud and drive:
 			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
 			backup = manager.backup(arg.resource)
+			# cloud.test()
 
 	except Exception as e:
 		logger.error(f"Unexpected error: {e}", exc_info=True)
 		sys.exit(1)
 	finally:
+		close = cloud.close_session()
+		logger.info(f"Closing session... {close.reason}")
 		logger.info(f"Finished in {round(time.time()-start_time)} sec")
