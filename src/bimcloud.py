@@ -27,7 +27,7 @@ class BIMcloudAPI():
 		self._session = None
 
 		self._r = self._setup_requests()
-		self._auth, self._session = self.authorize()
+		self.authorize()
 
 	def _setup_requests(self):
 		"""
@@ -40,7 +40,7 @@ class BIMcloudAPI():
 			max_retries=Retry(
 				total=1,
 				backoff_factor=1,
-				status_forcelist=[429, 430, 500, 502, 503, 504],
+				status_forcelist=[429, 500, 502, 503, 504],
 				allowed_methods=['GET', 'POST', 'DELETE',]
 			)
 		)
@@ -62,81 +62,60 @@ class BIMcloudAPI():
 		if access_token_exp is None:
 			raise ValueError("Missing 'access_token_exp' in auth data.")
 		if now >= access_token_exp - 10:
-				response = self.oauth2_refresh(self.auth.get('refresh_token'))
+				response = self.oauth2_refresh(self._auth.get('refresh_token'))
 				response.raise_for_status()
 				auth = response.json()
 				self._auth = auth
 
-	def _refresh_session(self):
-		"""
-		Refresh the session if it has expired.
-
-		Raises:
-			ValueError: If 'expire-timeout' or 'timestamp' is missing or session response is invalid.
-			requests.exceptions.RequestException: For any HTTP-related errors.
-		"""
-		now = time.time()
-		timestamp = self._session.get('timestamp')
-		expire_timeout = self._session.get('expire-timeout')
-		if timestamp is None or expire_timeout is None:
-			raise ValueError("Missing 'timestamp' or 'expire-timeout' in session data.")
-		if now - timestamp >= expire_timeout:
-			response = self.create_session()
-			response.raise_for_status()
-			session_data = response.json()
-			if session_data and session_data.get('session-id'):
-				session_data['timestamp'] = now
-				self._session = session_data
-			else:
-				raise ValueError("Invalid session response during refresh.")
-
-	def _send_request(self, method: str, url: str, *args, **kwargs):
+	def _send_request(self, method: str, url: str, **kwargs):
 		"""
 		Refresh the token/session if necessary and send an HTTP request.
 
 		Args:
 			method (str): HTTP method (e.g. 'GET', 'POST', 'DELETE').
 			url (str): URL to request.
-			*args: Additional positional arguments.
-			**kwargs: Additional keyword arguments.
+			**kwargs: Additional keyword arguments (e.g. timeout, stream, params, etc.).
+			Use the 'stream' key to indicate if the raw response should be returned.
 
 		Returns:
-			The parsed JSON response or raw content based on _take_response.
+			The parsed JSON response or raw response based on the 'stream' flag.
 
 		Raises:
-			HttpError: If the HTTP response is not OK.
+			RuntimeError: If the HTTP response is not OK.
 		"""
 		self.refresh_on_expiration()
-		headers = kwargs.pop('headers', {})
-		headers = {'Authorization': f"Bearer {self._auth.get('access_token')}", **headers}
-		response = self._r.request(method, url, headers=headers, **kwargs)
-		return self._take_response(response)
+		headers_extra = kwargs.pop('headers', {})
+		headers = {**{'Authorization': f"Bearer {self._auth.get('access_token')}"}, **headers_extra}
+		response = self._r.request(method.upper(), url, headers=headers, **kwargs)
+		return self._take_response(response, kwargs.get('stream', False))
 
-	def _take_response(self, response: requests.Response, json=True):
+	def _take_response(self, response: requests.Response, raw_stream: bool = False):
 		"""
 		Process the HTTP response.
 
 		Args:
 			response (requests.Response): The HTTP response.
-			json (bool): Whether to parse JSON. If False, return raw content.
+			raw_stream (bool): If True, return the raw response; otherwise, parse JSON.
 
 		Returns:
-			Parsed JSON or raw content if response has content; otherwise, None.
+			Parsed JSON data if response has content and raw_stream is False;
+			raw response if raw_stream is True;
+			or None if there is no content.
 
 		Raises:
-			HttpError: If the response is not OK.
+			RuntimeError: If the HTTP response status is not OK.
 		"""
 		has_content = response.content is not None and len(response.content)
 		if response.ok:
 			if has_content:
-				return response.json() if json else response.content
+				return response if raw_stream else response.json()
 			else:
 				return None
-		raise HttpError(response)
+		raise RuntimeError(f"Response Error {response}")
 
 	def authorize(self):
 		"""
-		Authorize with BIMcloud and create a session.
+		Authorize in BIMcloud instance.
 
 		Returns:
 			tuple: (auth, session) dictionaries.
@@ -152,41 +131,24 @@ class BIMcloudAPI():
 			self.log.error(f"Authentication error: {e}", exc_info=True)
 			raise RuntimeError("Authentication failed") from e
 
-		try:
-			response = self.create_session()
-			response.raise_for_status()
-			session = response.json()
-			session['timestamp'] = time.time()
-
-		except Exception as e:
-			self.log.error(f"Session error: {e}", exc_info=True)
-			raise RuntimeError("Session creation failed") from e
-
-		return auth, session
+		self._auth = auth
 
 	def refresh_on_expiration(self):
 		"""
-		Refresh the auth token and session if they are expired.
+		Refresh the auth token if expired.
 
 		Raises:
 			RuntimeError: If the refresh process fails.
 		"""
 		try:
 			self._refresh_token()
-			self._refresh_session()
-			self.log.debug("Auth token & session have been refreshed.")
+			self.log.debug("Authentication token refreshed.")
 		except requests.exceptions.RequestException as e:
 			self.log.error(f"Refresh error: {e}", exc_info=True)
 			raise RuntimeError("Refresh failed") from e
 
-
-	def test(self):
-		url = self.manager + '/get-server-info'
-		test = self._send_request('get', url)
-		print (test)
-
-
 	def oauth2(self, user, password, client_id):
+		""" Perform the OAuth2 authentication call. """
 		request = {
 			'grant_type': 'password',
 			'username': user,
@@ -198,81 +160,66 @@ class BIMcloudAPI():
 		return response
 
 	def oauth2_refresh(self):
+		""" Perform the OAuth2 token refresh call. """
 		request = {
 			'grant_type': 'refresh_token',
 			'refresh_token': self._auth.get('refresh_token'),
 			'client_id': self.client
 		}
 		url = self.manager + '/management/client/oauth2/token'
-		response = self._request_session.post(url, data=request, headers={'Content-Type': 'application/x-www-form-urlencoded'}, timeout=30)
-		return response
-
-	def create_session(self):
-		request = {
-			'username': self._user,
-			'password': self._password,
-			'client-id': self._client
-		}
-		url = self.manager + '/management/latest/create-session'
-		response = requests.post(url, json=request)
-		return response
-
-	def close_session(self, session_id=None):
-		if not session_id:
-			session_id = self._session.get('session-id')
-		url = self.manager + '/management/latest/close-session'
-		response = requests.post(url, params={'session-id': session_id})
-		return response
-
-	def ping_session(self, session_id=None):
-		if not session_id:
-			session_id = self._session.get('session-id')
-		url = self.manager + '/management/latest/ping-session'
-		response = requests.post(url, params={'session-id': session_id})
+		response = self._r.post(url, data=request, headers={'Content-Type': 'application/x-www-form-urlencoded'}, timeout=30)
 		return response
 
 	def create_resource_backup(self, resource_id, backup_type, backup_name):
+		""" Create a new backup for a resource. """
 		url = self.manager + '/management/latest/create-resource-backup'
-		response = requests.post(url, headers=self.auth_header, params={'resource-id': resource_id, 'backup-type': backup_type, 'backup-name': backup_name})
-		return response.json()
+		response = self._send_request('post', url,  params={'resource-id': resource_id, 'backup-type': backup_type, 'backup-name': backup_name})
+		return response
 
 	def delete_resource_backup(self, resource_id, backup_id):
+		""" Delete a specific resource backup. """
 		url = self.manager + '/management/latest/delete-resource-backup'
-		response = requests.delete(url, headers=self.auth_header, params={'resource-id': resource_id, 'backup-id': backup_id})
+		response = self._send_request('delete', url, params={'resource-id': resource_id, 'backup-id': backup_id})
 		return response
 
 	def delete_resource_backup_schedule(self, resource_id):
+		""" Delete backup schedules for a resource. """
 		url = self.manager + '/management/latest/delete-resource-backup-schedule'
-		response = requests.delete(url, headers=self.auth_header, params={'resource-id': resource_id})
+		response = self._send_request('delete', url, params={'resource-id': resource_id})
 		return response
 
-	def get_jobs(self, criterion={}, params={}):
-		params = params or {}
+	def get_jobs(self, criterion=None, params=None):
+		""" Retrieve jobs based on given criteria. """
 		url = self.manager + '/management/client/get-jobs-by-criterion'
-		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
+		response = self._send_request('post', url, params=params, json=criterion)
 		return response
 
 	def download_backup(self, resource_id, backup_id, timeout=300, stream=False):
+		""" Download a backup file from BIMcloud. """
 		url = self.manager + '/management/client/download-backup'
-		response = requests.get(url, params={'session-id': self.session['session-id'], 'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout, stream=stream)
+		response = self._send_request('get', url, params={'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout, stream=stream)
 		return response 
 
-	def get_resources_by_criterion(self, criterion={}, params={}):
+	def get_resources_by_criterion(self, criterion=None, params=None):
+		""" Retrieve resources based on a given criterion. """
 		url = self.manager + '/management/client/get-resources-by-criterion'
-		response = requests.post(url, headers=self.auth_header, params=params, json=criterion)
-		return response.json()
+		response = self._send_request('post', url, params=params, json=criterion)
+		return response
 
-	def get_resources_by_id_list(self, ids, params):
+	def get_resources_by_id_list(self, ids, params=None):
+		""" Retrieve resources by a list of IDs. """
 		url = self.manager + '/management/client/get-resources-by-id-list'
-		response = self._send_request('post', url, json=ids)
+		response = self._send_request('post', url, params=params, json=ids)
 		return response
 
 	def get_resource_backups(self, resources_ids, criterion=None, params=None):
+		""" Retrieve backups for given resource IDs using specific criteria. """
 		url = self.manager + '/management/client/get-resource-backups-by-criterion'
 		response = self._send_request('post', url, params=params, json={'ids': resources_ids, 'criterion': criterion})
 		return response
 
 	def get_resource_backup_schedules(self, criterion=None):
+		""" Retrieve backup schedules based on a given criterion. """
 		url = self.manager + '/management/client/get-resource-backup-schedules-by-criterion'
 		response = self._send_request('post', url, json=criterion)
 		return response
@@ -290,6 +237,7 @@ class BIMcloudAPI():
 			type = 'resourceBackupSchedule',
 			revision = 0
 		):
+		""" Insert a backup schedule for a resource. """
 		schedule = {
 			'id': backupType+targetResourceId,
 			'$hidden': False,
@@ -297,5 +245,5 @@ class BIMcloudAPI():
 		}
 		schedule = {key: value for key, value in locals().items() if key not in ('self')}
 		url = self.manager + '/management/client/insert-resource-backup-schedule'
-		response = requests.post(url, headers=self.auth_header, json=schedule)
+		response = self._send_request('post', url, json=schedule)
 		return response

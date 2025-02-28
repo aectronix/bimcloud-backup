@@ -91,9 +91,6 @@ class BackupManager():
 				del resource
 				gc.collect()
 
-				# self.client._create_or_refresh_auth_token()
-				# self.client._create_or_refresh_session()
-
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
 		params = { 'sort-by': '$time', 'sort-direction': 'desc' }
@@ -140,7 +137,7 @@ class BackupManager():
 			}
 		)
 		if jobs and not isinstance(jobs, str):
-			job = jobs.json()[0]
+			job = jobs[0]
 			self.log.info(
 			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>"
 			)
@@ -251,9 +248,7 @@ class BackupManager():
 		schedule_delete_r = None
 		schedules = self.client.get_resource_backup_schedules({'$eq': {'targetResourceId': resource_id}})
 		if schedules:
-			print (schedules)
 			for s in schedules:
-				print (s)
 				if s and not isinstance(s, str):
 					schedule_delete_r = self.client.delete_resource_backup_schedule(s['id'])
 			self.log.info(f"Deleted: {len(schedules)} schedules")
@@ -272,7 +267,7 @@ class BackupManager():
 			start_time = time.time()
 			last_update = start_time
 
-			for chunk in response.iter_content(chunk_size=4096):
+			for chunk in response.iter_content(chunk_size=1024*1024*5):
 				if chunk:
 					chunks.append(chunk)
 					downloaded += len(chunk)
@@ -292,7 +287,6 @@ class BackupManager():
 	def transfer_backup(self, resource_name, resource_id, resource_size, backup_id):
 		self.log.info(f"Get contents and save to the cloud...")
 		timeout = self.get_timeout_from_filesize(resource_size, e=1.30) # adjusting for google
-		# data = self.isolate_with_timeout(self.get_backup_data, timeout=timeout, delay=1, message='receiving', resource_id=resource_id, backup_id=backup_id)
 		data = self.get_backup_data(resource_id, backup_id, timeout)
 		if not data:
 			logger.error(f"Failed to retreive backup data! Skipped.")
@@ -367,12 +361,9 @@ if __name__ == "__main__":
 		if cloud and drive:
 			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
 			backup = manager.backup(arg.resource)
-			# cloud.test()
 
 	except Exception as e:
 		logger.error(f"Unexpected error: {e}", exc_info=True)
 		sys.exit(1)
 	finally:
-		close = cloud.close_session()
-		logger.info(f"Closing session... {close.reason}")
 		logger.info(f"Finished in {round(time.time()-start_time)} sec")
