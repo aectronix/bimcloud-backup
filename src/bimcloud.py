@@ -239,11 +239,20 @@ class BIMcloudAPI():
 		):
 		""" Insert a backup schedule for a resource. """
 		schedule = {
-			'id': backupType+targetResourceId,
+			'id': backupType + targetResourceId,
 			'$hidden': False,
-			"$visibility": 'full'
+			'$visibility': 'full',
+			'targetResourceId': targetResourceId,
+			'backupType': backupType,
+			'enabled': enabled,
+			'maxBackupCount': maxBackupCount,
+			'repeatInterval': repeatInterval,
+			'repeatCount': repeatCount,
+			'startTime': startTime,
+			'endTime': endTime,
+			'type': type,
+			'revision': revision
 		}
-		schedule = {key: value for key, value in locals().items() if key not in ('self')}
 		url = self.manager + '/management/client/insert-resource-backup-schedule'
 		response = self._send_request('post', url, json=schedule)
 		return response

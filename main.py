@@ -1,5 +1,4 @@
 import argparse
-import gc
 import logging
 import math
 import sys
@@ -10,25 +9,51 @@ from src import *
 
 class BackupManager():
 
-	def __init__(self, client, storage, **parameters):
+	def __init__(self, client, storage, **kwargs):
+		"""
+		Initialize the BackupManager.
+
+		Args:
+			client: BIMcloud API client instance.
+			storage: Google Drive API instance.
+			**kwargs: Additional parameters, e.g., schedule_enabled.
+		"""
 		self.log = logging.getLogger('BackupManager')
 		self.client = client
 		self.storage = storage
-		self.schedule_enabled = parameters.get('schedule_enabled')
+		self.schedule_enabled = kwargs.get('schedule_enabled')
 
 	@staticmethod
 	def get_timeout_from_filesize(size, b=60.0, f=15.0, e=1.40, div=1000000) -> int:
-		"""	Calculates timeout while processing the file regarding it's size in bytes.
+		"""
+		Calculate a timeout based on the file size.
+
 		Args:
-			b (int): 	base time, seconds
-			f (int): 	scaling factor
-			e (int): 	exponent power
-			div (int):	division, bytes (to get Kb, Mb, Gb etc as input factor)
+			size (int): File size in bytes.
+			b (float): Base time in seconds.
+			f (float): Scaling factor.
+			e (float): Exponent.
+			div (int): Divisor to convert bytes (e.g. to MB).
+
+		Returns:
+			int: Calculated timeout in seconds.
 		"""
 		return b + round(f * (size/div ** e), 0)
 
 	def run_with_timeout(self, fn, timeout, delay, *args, **kwargs):
-		"""	Adds timeout for the function. """
+		"""
+		Execute a function repeatedly until it returns a result or the timeout expires.
+
+		Args:
+			fn (callable): The function to execute.
+			timeout (int): Maximum time in seconds to wait.
+			delay (int): Delay between function calls.
+			*args: Positional arguments for fn.
+			**kwargs: Keyword arguments for fn.
+
+		Returns:
+			The result returned by fn, or None if timed out.
+		"""
 		start_time = time.time()
 		while (runtime := time.time() - start_time) < timeout:
 			kwargs.update({"runtime": runtime, "timeout": timeout})
@@ -40,56 +65,62 @@ class BackupManager():
 		return None
 
 	def backup(self, ids=[]) -> None:
-		"""	Starts resource backup procedure. """
-		i = 0
+		"""
+		Start the resource backup procedure.
+		Iterates over resources and processes them based on type.
+		"""
 		resources = self.get_resources(ids)
-		if resources:
-			self.log.info(f"Found resources: {len(resources)}, starting backup process...")
-			for resource in resources:
-				i += 1
-				self.log.info(f"Resource #{i}:")
-				self.log.info(f"{resource['id']} ({resource['type']}: \"{resource['name']}\", {round(resource['$size']/1024 **2, 2)} Mb)")
-				timeout = self.get_timeout_from_filesize(resource['$size'])
-				# remove all schedules if required
-				if self.schedule_enabled == 'n':
+		if not resources:
+			self.log.info("No resources found.")
+			return
+
+		self.log.info(f"Found resources: {len(resources)}, starting backup process...")
+		i = 0
+		for resource in resources:
+			i += 1
+			self.log.info(f"Resource #{i}:")
+			self.log.info(f"{resource['id']} ({resource['type']}: \"{resource['name']}\", {round(resource['$size']/1024 **2, 2)} Mb)")
+			timeout = self.get_timeout_from_filesize(resource['$size'])
+			
+			# remove all schedules if required
+			if self.schedule_enabled == 'n':
+				_ = self.delete_resource_schedules(resource['id'])
+			# check backups
+			has_outdated_backup = True
+			backups = self.client.get_resource_backups([resource['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or []
+			if 	(backups and backups[0].get('$time') >= resource.get('$modifiedDate')) or \
+				(not backups and resource.get('$modifiedDate') == resource.get('$uploadedTime')): # special for libs
+				has_outdated_backup = False
+			# create new, remove old
+			if has_outdated_backup:
+				start_time = time.time()
+
+				if resource['type'] == 'project':
+					for b in backups:
+						if b and b.get('$time') <= resource['$modifiedDate']:
+							delete_backup_r = self.delete_project_backup(resource['id'], b['id'])
+							self.log.info(f"Deleted: {len(backups)} backups, {delete_backup_r}")
+					project_create_r = self.create_project_backup(resource['id'])
+					result = self.run_with_timeout(self.is_project_backup_created, timeout, 1, project_create_r['id'])
+					backup_new = self.is_project_backup_valid(result, start_time)
+					if backup_new:
+						self.log.info(f"Backup successfully created.")
+						self.transfer_backup(resource, backup_new['id'])
+
+				if resource['type'] == 'library':
+					library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
+					result = self.run_with_timeout(self.is_library_backup_created, timeout, 1, resource['id'], start_time)
 					schedule_delete_r = self.delete_resource_schedules(resource['id'])
-				# check backups
-				has_outdated_backup = True
-				backups = self.client.get_resource_backups([resource['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or []
-				if 	(backups and backups[0].get('$time') >= resource.get('$modifiedDate')) or \
-					(not backups and resource.get('$modifiedDate') == resource.get('$uploadedTime')): # special for libs
-					has_outdated_backup = False
-				# create new, remove old
-				if has_outdated_backup:
-					start_time = time.time()
+					backup_new = self.is_library_backup_valid(resource['id'], result['id'], start_time)
+					if backup_new:
+						self.log.info(f"Backup successfully created.")
+						self.transfer_backup(resource, backup_new['id'])
+			else:
+				self.log.info(f"Resource has valid backup, skipped")
+			# don't hurry up
+			time.sleep(1)
 
-					if resource['type'] == 'project':
-						for b in backups:
-							if b and b.get('$time') <= resource['$modifiedDate']:
-								delete_backup_r = self.delete_project_backup(resource['id'], b['id'])
-								self.log.info(f"Deleted: {len(backups)} backups, {delete_backup_r}")
-						project_create_r = self.create_project_backup(resource['id'])
-						result = self.run_with_timeout(self.is_project_backup_created, timeout, 1, project_create_r['id'])
-						backup_new = self.is_project_backup_valid(result, start_time)
-						if backup_new:
-							self.log.info(f"Backup successfully created.")
-							self.transfer_backup(resource['name'], resource['id'], resource['$size'], backup_new['id'])
-
-					if resource['type'] == 'library':
-						library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
-						result = self.run_with_timeout(self.is_library_backup_created, timeout, 1, resource['id'], start_time)
-						schedule_delete_r = self.delete_resource_schedules(resource['id'])
-						backup_new = self.is_library_backup_valid(resource['id'], result['id'], start_time)
-						if backup_new:
-							self.log.info(f"Backup successfully created.")
-							self.transfer_backup(resource['name'], resource['id'], resource['$size'], backup_new['id'])
-				else:
-					self.log.info(f"Resource has valid backup, skipped")
-				# don't hurry up
-				time.sleep(1)
-
-				del resource
-				gc.collect()
+			del resource
 
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
@@ -98,7 +129,7 @@ class BackupManager():
 			result = self.client.get_resources_by_id_list([ids], params)
 			if result:
 				return result
-			self.log.info(f"Resource not found.")
+			return None
 		return self.client.get_resources_by_criterion(
 			{
 				'$or': [
@@ -109,7 +140,7 @@ class BackupManager():
 			params
 		)
 
-	def create_project_backup(self, resource_id):
+	def create_project_backup(self, resource_id: str):
 		"""	Creates a new backup for project resource. """
 		self.log.info(f"Creating a new backup...")
 		response = self.client.create_resource_backup(
@@ -138,9 +169,7 @@ class BackupManager():
 		)
 		if jobs and not isinstance(jobs, str):
 			job = jobs[0]
-			self.log.info(
-			    f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>"
-			)
+			self.log.info(f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>")
 			if job['status'] in ['completed', 'failed']:
 				print ('', flush=True)
 				return job
@@ -170,30 +199,45 @@ class BackupManager():
 		return None
 
 	def delete_project_backup(self, resource_id, backup_id):
-		"""	Removes targeted backup. """
+		"""
+		Delete a specific project backup.
+
+		Args:
+			resource_id (str): The resource ID.
+			backup_id (str): The backup ID.
+
+		Returns:
+			The deletion response.
+		"""
 		response = self.client.delete_resource_backup(resource_id, backup_id)
 		return response
 
 	def invoke_library_backup(self, resource_id, action_time, offset=10, interval=3600):
-		""" Triggers scheduler to trigger auto backup.
-			Note: workaround
-			As we cannot remove custom backups from the library resource later, we're forced
-			to operate with automatic backups in a single copy only. To create an automatic
-			backup we could setup a scheduler with the start time a 1h before and small delay.
 		"""
-		self.log.info(f"Inserting temporary backup schedule to trigger auto backup...")
-		response = self.client.insert_resource_backup_schedule(
-			targetResourceId = resource_id,
-			backupType = 'bimlibrary',
-			maxBackupCount = 1,
-			repeatInterval = 3600,
-			startTime = action_time + offset - interval
-		)
-		if response:
-			self.log.info(f"Inserted, expecting scheduler to create backup")
-			return response
-		self.log.error(f"Failed to insert backup schedule: {resource_id}")
-		return None
+		Trigger the scheduler to create an automatic library backup.
+		Note: Workaround to force a single automatic backup copy.
+
+		Args:
+			resource_id (str): The resource ID.
+			action_time (float): The action timestamp.
+			offset (int, optional): Offset for start time.
+			interval (int, optional): The interval between backups.
+
+		Returns:
+			None
+		"""
+		self.log.info(f"Inserting temporary backup schedule to trigger an auto backup...")
+		try:
+			_ = self.client.insert_resource_backup_schedule(
+				targetResourceId = resource_id,
+				backupType = 'bimlibrary',
+				maxBackupCount = 1,
+				repeatInterval = 3600,
+				startTime = action_time + offset - interval
+			)
+		except Exception as e:
+			self.log.error(f"Response error: {e}", exc_info=True)
+			return None
 
 	def is_library_backup_created(self, resource_id, action_time, **kwargs):
 		backups = self.client.get_resource_backups(
@@ -219,6 +263,7 @@ class BackupManager():
 		return None
 
 	def is_library_backup_valid(self, resource_id, backup_id, start_time):
+		""" Validate a library backup by comparing its properties. """
 		backups = self.client.get_resource_backups(
 			[resource_id],
 			criterion = {
@@ -235,16 +280,12 @@ class BackupManager():
 		)
 		if backups:
 			backup = backups[0]
-			return (
-				backup.get('id') == backup_id and
-				backup.get('$statusId') == '_server.backup.status.done' and
-				backup.get('$fileSize', 0) > 0
-			)
 			if backup.get('id') == backup_id and backup.get('$statusId') == '_server.backup.status.done' and backup.get('$fileSize', 0) > 0:
 				return backup
 		return False
 
-	def delete_resource_schedules(self, resource_id):
+	def delete_resource_schedules(self, resource_id: str):
+		""" Delete backup schedules for a specific resource. """
 		schedule_delete_r = None
 		schedules = self.client.get_resource_backup_schedules({'$eq': {'targetResourceId': resource_id}})
 		if schedules:
@@ -257,6 +298,17 @@ class BackupManager():
 			return None
 
 	def get_backup_data(self, resource_id, backup_id, timeout=300):
+		"""
+		Retrieve backup data from BIMcloud by streaming the response.
+
+		Args:
+			resource_id (str): The resource ID.
+			backup_id (str): The backup ID.
+			timeout (int, optional): The request timeout in seconds.
+
+		Returns:
+			bytes: The downloaded backup data, or None if timed out.
+		"""
 		with self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True) as response:
 			response.raise_for_status()
 			total_length = response.headers.get('content-length')
@@ -284,32 +336,44 @@ class BackupManager():
 				self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
 				print ('', flush=True)
 			except requests.exceptions.ReadTimeout as e:
-			    self.log.error("Read timeout during download", exc_info=True)
+			    self.log.error("Error (timeout?) during download", exc_info=True)
 			    raise
 		return content
 
-	def transfer_backup(self, resource_name, resource_id, resource_size, backup_id):
+	def transfer_backup(self, resource, backup_id):
+		"""
+		Retrieve backup data from BIMcloud and upload it to Google Drive.
+
+		Args:
+			resource_name (str): The resource name.
+			resource_id (str): The resource ID.
+			resource_size (int): The resource file size.
+			backup_id (str): The backup ID.
+
+		Returns:
+			None
+		"""
 		self.log.info(f"Get contents and save to the cloud...")
-		timeout = self.get_timeout_from_filesize(resource_size, e=1.25) # adjusting for google
-		data = self.get_backup_data(resource_id, backup_id, timeout)
+		timeout = self.get_timeout_from_filesize(resource['$size'], e=1.25) # adjusting for google
+		data = self.get_backup_data(resource['id'], backup_id, timeout)
 		if not data:
 			logger.error(f"Failed to retreive backup data! Skipped.")
 			return None
 		files = self.storage.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
-		match_file = next((f for f in files if f['name'] == resource_name+'.BIMProject25'), None)
+		name = resource['name']+'.bim'+resource['type']+'25'
+		match_file = next((f for f in files if f['name'] == name), None)
 		match_file_id = match_file['id'] if match_file else None
 		request = self.storage.prepare_upload(
 			data,
-			file_name = resource_name+'.BIMProject25',
+			file_name = name,
 			file_id = match_file_id,
-			resource_id = resource_id
+			resource_id = resource['id']
 		)
 		upload = self.run_with_timeout(self.storage.upload_chunks, timeout, 0.05, request)
 		if upload:
 			self.log.info(f"Successfully uploaded to the cloud. ({upload['id']})")
 
 		del data
-		gc.collect()
 
 
 if __name__ == "__main__":
