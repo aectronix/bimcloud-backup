@@ -10,6 +10,13 @@ from googleapiclient.http import MediaFileUpload
 class GoogleDriveAPI():
 
     def __init__(self, cred_path, account):
+        """
+        Initialize the GoogleDriveAPI instance.
+
+        Args:
+            cred_path (str): Path to the Google credentials JSON file.
+            account (str): The email address or account identifier to impersonate.
+        """
         self.log = logging.getLogger("BackupManager")
         self.scopes = [
             'https://www.googleapis.com/auth/drive',
@@ -21,6 +28,16 @@ class GoogleDriveAPI():
         self.authorize(cred_path, account)
 
     def authorize(self, cred_path, account):
+        """
+        Authorize with Google Drive using a service account.
+
+        Args:
+            cred_path (str): Path to the credentials JSON.
+            account (str): The email or account to impersonate.
+
+        Raises:
+            RuntimeError: If authorization fails.
+        """
         try:
             credentials = service_account.Credentials.from_service_account_file(
                 cred_path,
@@ -32,16 +49,27 @@ class GoogleDriveAPI():
                 self.log.info(f"Cloud storage initialized: {service._baseUrl} ({account.split('@')[0]})")
         except Exception as e:
             self.log.error(f"Auth Error: {e}", exc_info=True)
-            sys.exit(1)
+            raise RuntimeError("Google Drive authorization failed") from e
 
-    def execute_request(self, queue, request):
-        try:
-            result = request.execute()
-            queue.put(result)
-        except Exception as e:
-            queue.put(e)
+    # def execute_request(self, queue, request):
+    #     """
+    #     Execute a Drive API request in a separate process and place the result in a queue.
+
+    #     Args:
+    #         queue (multiprocessing.Queue): The queue to store the result.
+    #         request: A Drive API request object.
+
+    #     Returns:
+    #         None. The result or exception is placed on the queue.
+    #     """
+    #     try:
+    #         result = request.execute()
+    #         queue.put(result)
+    #     except Exception as e:
+    #         queue.put(e)
 
     def get_folder_resources(self, folder_id):
+        """ Retrieve the list of files in a given folder. """
         try:
             result = self.service.files().list(
                 q = f"'{folder_id}' in parents",
@@ -54,6 +82,18 @@ class GoogleDriveAPI():
             sys.exit(1)
 
     def prepare_upload(self, data, file_name, file_id=None, **kwargs):
+        """
+        Prepare an upload request for a file to Google Drive.
+
+        Args:
+            data (bytes): The file data.
+            file_name (str): The name of the file.
+            file_id (str, optional): The file ID to update (if any).
+            **kwargs: Additional keyword arguments, e.g. 'resource_id' for file description.
+
+        Returns:
+            A Drive API request object ready for upload.
+        """
         file_stream = io.BytesIO(data)
         file_stream.seek(0)
         file_metadata = {
@@ -63,7 +103,7 @@ class GoogleDriveAPI():
         media = MediaIoBaseUpload(
             file_stream,
             mimetype = 'application/octet-stream',
-            chunksize = 1024*1024*5, # max
+            chunksize = 1024*1024*5, # 5MB is max
             resumable = True
         )
         params = {
@@ -80,6 +120,16 @@ class GoogleDriveAPI():
         return request
 
     def upload_chunks(self, request, **kwargs):
+        """
+        Upload file content in chunks using a resumable upload request.
+
+        Args:
+            request: A resumable upload request object.
+            **kwargs: Additional keyword arguments (e.g. runtime, timeout).
+
+        Returns:
+            The final response of the upload (e.g. file metadata) upon completion.
+        """
         response = None
         status, response = request.next_chunk()
         if status:

@@ -17,7 +17,7 @@ class BackupManager():
 		self.schedule_enabled = parameters.get('schedule_enabled')
 
 	@staticmethod
-	def get_timeout_from_filesize(size, b=60.0, f=15.0, e=1.45, div=1000000) -> int:
+	def get_timeout_from_filesize(size, b=60.0, f=15.0, e=1.40, div=1000000) -> int:
 		"""	Calculates timeout while processing the file regarding it's size in bytes.
 		Args:
 			b (int): 	base time, seconds
@@ -267,26 +267,30 @@ class BackupManager():
 			start_time = time.time()
 			last_update = start_time
 
-			for chunk in response.iter_content(chunk_size=1024*1024*5):
-				if chunk:
-					chunks.append(chunk)
-					downloaded += len(chunk)
-					now = time.time()
-					runtime = now - start_time
-					if runtime > timeout:
-						self.log.error(f"timeout!")
-						return None
-					if now - last_update >= 1:
-						self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
-						last_update = now
-			content = b''.join(chunks)
-			self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
-			print ('', flush=True)
+			try:
+				for chunk in response.iter_content(chunk_size=1024*1024*5):
+					if chunk:
+						chunks.append(chunk)
+						downloaded += len(chunk)
+						now = time.time()
+						runtime = now - start_time
+						if runtime > timeout:
+							self.log.error(f"timeout!")
+							return None
+						if now - last_update >= 1:
+							self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+							last_update = now
+				content = b''.join(chunks)
+				self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+				print ('', flush=True)
+			except requests.exceptions.ReadTimeout as e:
+			    self.log.error("Read timeout during download", exc_info=True)
+			    raise
 		return content
 
 	def transfer_backup(self, resource_name, resource_id, resource_size, backup_id):
 		self.log.info(f"Get contents and save to the cloud...")
-		timeout = self.get_timeout_from_filesize(resource_size, e=1.30) # adjusting for google
+		timeout = self.get_timeout_from_filesize(resource_size, e=1.25) # adjusting for google
 		data = self.get_backup_data(resource_id, backup_id, timeout)
 		if not data:
 			logger.error(f"Failed to retreive backup data! Skipped.")

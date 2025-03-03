@@ -38,7 +38,7 @@ class BIMcloudAPI():
 		"""
 		adapter = requests.adapters.HTTPAdapter(
 			max_retries=Retry(
-				total=1,
+				total=3,
 				backoff_factor=1,
 				status_forcelist=[429, 500, 502, 503, 504],
 				allowed_methods=['GET', 'POST', 'DELETE',]
@@ -62,7 +62,7 @@ class BIMcloudAPI():
 		if access_token_exp is None:
 			raise ValueError("Missing 'access_token_exp' in auth data.")
 		if now >= access_token_exp - 10:
-				response = self.oauth2_refresh(self._auth.get('refresh_token'))
+				response = self.oauth2_refresh()
 				response.raise_for_status()
 				auth = response.json()
 				self._auth = auth
@@ -164,7 +164,7 @@ class BIMcloudAPI():
 		request = {
 			'grant_type': 'refresh_token',
 			'refresh_token': self._auth.get('refresh_token'),
-			'client_id': self.client
+			'client_id': self._client
 		}
 		url = self.manager + '/management/client/oauth2/token'
 		response = self._r.post(url, data=request, headers={'Content-Type': 'application/x-www-form-urlencoded'}, timeout=30)
