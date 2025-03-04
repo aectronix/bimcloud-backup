@@ -127,6 +127,7 @@ class BIMcloudAPI():
 			response = self.oauth2(self._user, self._password, self._client)
 			response.raise_for_status()
 			auth = response.json()
+			self.log.info(f"Connected to bimcloud on: {self.manager}")
 		except Exception as e:
 			self.log.error(f"Authentication error: {e}", exc_info=True)
 			raise RuntimeError("Authentication failed") from e

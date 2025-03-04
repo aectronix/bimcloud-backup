@@ -1,3 +1,4 @@
+import json
 import io
 import logging
 import time
@@ -39,8 +40,9 @@ class GoogleDriveAPI():
             RuntimeError: If authorization fails.
         """
         try:
-            credentials = service_account.Credentials.from_service_account_file(
-                cred_path,
+            service_account_info = json.load(open(cred_path))
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_info['google_drive'],
                 scopes = self.scopes
             ).with_subject(account)
             service = build('drive', 'v3', credentials=credentials)
@@ -48,25 +50,7 @@ class GoogleDriveAPI():
                 self.service = service
                 self.log.info(f"Cloud storage initialized: {service._baseUrl} ({account.split('@')[0]})")
         except Exception as e:
-            self.log.error(f"Auth Error: {e}", exc_info=True)
             raise RuntimeError("Google Drive authorization failed") from e
-
-    # def execute_request(self, queue, request):
-    #     """
-    #     Execute a Drive API request in a separate process and place the result in a queue.
-
-    #     Args:
-    #         queue (multiprocessing.Queue): The queue to store the result.
-    #         request: A Drive API request object.
-
-    #     Returns:
-    #         None. The result or exception is placed on the queue.
-    #     """
-    #     try:
-    #         result = request.execute()
-    #         queue.put(result)
-    #     except Exception as e:
-    #         queue.put(e)
 
     def get_folder_resources(self, folder_id):
         """ Retrieve the list of files in a given folder. """

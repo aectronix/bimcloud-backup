@@ -23,6 +23,12 @@ class BackupManager():
 		self.storage = storage
 		self.schedule_enabled = kwargs.get('schedule_enabled')
 
+		self.report = {
+			'backups': 0,
+			'endtime': 0,
+			'errors': 0
+		}
+
 	@staticmethod
 	def get_timeout_from_filesize(size, b=60.0, f=15.0, e=1.40, div=1000000) -> int:
 		"""
@@ -62,6 +68,7 @@ class BackupManager():
 			time.sleep(delay)
 		print ('', flush=True)
 		self.log.error(f"Process timed out! Skipped. ({fn.__name__} {args})")
+		self.report['errors'] += 1
 		return None
 
 	def backup(self, ids=[]) -> None:
@@ -72,10 +79,11 @@ class BackupManager():
 		resources = self.get_resources(ids)
 		if not resources:
 			self.log.info("No resources found.")
+			self.report['errors'] += 1
 			return
 
 		self.log.info(f"Found resources: {len(resources)}, starting backup process...")
-		i = 0
+		i, b = 0, 0
 		for resource in resources:
 			i += 1
 			self.log.info(f"Resource #{i}:")
@@ -94,33 +102,39 @@ class BackupManager():
 			# create new, remove old
 			if has_outdated_backup:
 				start_time = time.time()
+				backup_new = None
 
 				if resource['type'] == 'project':
-					for b in backups:
-						if b and b.get('$time') <= resource['$modifiedDate']:
-							delete_backup_r = self.delete_project_backup(resource['id'], b['id'])
+					for bcp in backups:
+						if bcp and bcp.get('$time') <= resource['$modifiedDate']:
+							delete_backup_r = self.delete_project_backup(resource['id'], bcp['id'])
 							self.log.info(f"Deleted: {len(backups)} backups, {delete_backup_r}")
 					project_create_r = self.create_project_backup(resource['id'])
 					result = self.run_with_timeout(self.is_project_backup_created, timeout, 1, project_create_r['id'])
 					backup_new = self.is_project_backup_valid(result, start_time)
-					if backup_new:
-						self.log.info(f"Backup successfully created.")
-						self.transfer_backup(resource, backup_new['id'])
 
 				if resource['type'] == 'library':
 					library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
 					result = self.run_with_timeout(self.is_library_backup_created, timeout, 1, resource['id'], start_time)
 					schedule_delete_r = self.delete_resource_schedules(resource['id'])
 					backup_new = self.is_library_backup_valid(resource['id'], result['id'], start_time)
-					if backup_new:
-						self.log.info(f"Backup successfully created.")
-						self.transfer_backup(resource, backup_new['id'])
+
+				if backup_new:
+					self.log.info(f"Backup successfully created.")
+					self.transfer_backup(resource, backup_new['id'])
+					b += 1
 			else:
 				self.log.info(f"Resource has valid backup, skipped")
 			# don't hurry up
 			time.sleep(1)
 
 			del resource
+
+		self.report['backups'] = b
+		self.report['endtime'] = time.time()
+
+	# def get_report(self):
+	# 	return self.report
 
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
@@ -150,6 +164,7 @@ class BackupManager():
 		)
 		if not response or not response.get('id'):
 			self.log.error(f"Failed to initiate backup.")
+			self.report['errors'] += 1
 			return None
 		return response
 
@@ -337,6 +352,7 @@ class BackupManager():
 				print ('', flush=True)
 			except requests.exceptions.ReadTimeout as e:
 			    self.log.error("Error (timeout?) during download", exc_info=True)
+			    self.report['errors'] += 1
 			    raise
 		return content
 
@@ -358,6 +374,7 @@ class BackupManager():
 		data = self.get_backup_data(resource['id'], backup_id, timeout)
 		if not data:
 			logger.error(f"Failed to retreive backup data! Skipped.")
+			self.report['errors'] += 1
 			return None
 		files = self.storage.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
 		name = resource['name']+'.bim'+resource['type']+'25'
@@ -390,7 +407,7 @@ if __name__ == "__main__":
 	cmd.add_argument('-f', '--filepath', required=False, help='Path to the log file')
 	cmd.add_argument('-r', '--resource', required=False, help='Resource Id')
 	# drive
-	cmd.add_argument('-k', '--gd_cred_path', required=True, help='Path to Gogole credentials')
+	cmd.add_argument('-k', '--cred_path', required=True, help='Path to Gogole credentials')
 	arg = cmd.parse_args()
 
 	class LogHandler(logging.StreamHandler):
@@ -425,13 +442,26 @@ if __name__ == "__main__":
 
 	try:
 		cloud = BIMcloudAPI(**vars(arg))
-		drive = GoogleDriveAPI(arg.gd_cred_path, arg.client)
+		drive = GoogleDriveAPI(arg.cred_path, arg.client)
+		notion = NotionAPI(arg.cred_path)
 		if cloud and drive:
 			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
 			backup = manager.backup(arg.resource)
 
+			status = 'Done' if manager.report['errors'] == 0 else 'Errors'
+
 	except Exception as e:
 		logger.error(f"Unexpected error: {e}", exc_info=True)
+		manager.report['errors'] += 1
+		status = 'Failure'
 		sys.exit(1)
 	finally:
+		notion.send_report(
+			data = {
+				'items': manager.report['backups'],
+				'time': round(manager.report['endtime'] - start_time),
+				'errors': manager.report['errors'],
+				'status': status,
+			}
+		)
 		logger.info(f"Finished in {round(time.time()-start_time)} sec")
