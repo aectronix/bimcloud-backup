@@ -324,36 +324,39 @@ class BackupManager():
 		Returns:
 			bytes: The downloaded backup data, or None if timed out.
 		"""
-		with self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True) as response:
-			response.raise_for_status()
-			total_length = response.headers.get('content-length')
-			if total_length is not None:
-				total_length = int(total_length)
-			downloaded = 0
-			chunks = []
-			start_time = time.time()
-			last_update = start_time
+		response = self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True)
+		total_length = response.headers.get('content-length')
+		if total_length is not None:
+			total_length = int(total_length)
+		content = None
+		downloaded = 0
+		chunks = []
+		start_time = time.time()
+		last = start_time
+		
+		if response.ok:
+			for chunk in response.iter_content(chunk_size=1024*64):
+				if chunk:
+					chunks.append(chunk)
+					downloaded += len(chunk)
+					now = time.time()
+					runtime = now - start_time
+					if runtime > timeout:
+						self.log.error("Error (timeout?) during download", exc_info=True)
+						self.report['errors'] += 1
+						return None
+					self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+					last = now
 
-			try:
-				for chunk in response.iter_content(chunk_size=1024*1024*5):
-					if chunk:
-						chunks.append(chunk)
-						downloaded += len(chunk)
-						now = time.time()
-						runtime = now - start_time
-						if runtime > timeout:
-							self.log.error(f"timeout!")
-							return None
-						if now - last_update >= 1:
-							self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
-							last_update = now
-				content = b''.join(chunks)
-				self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
-				print ('', flush=True)
-			except requests.exceptions.ReadTimeout as e:
-			    self.log.error("Error (timeout?) during download", exc_info=True)
-			    self.report['errors'] += 1
-			    raise
+			content = b''.join(chunks)
+			self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+			print ('', flush=True)
+
+		else:
+			self.log.error("Error during backup download", exc_info=True)
+			self.report['errors'] += 1
+			return None
+
 		return content
 
 	def transfer_backup(self, resource, backup_id):
@@ -396,6 +399,9 @@ class BackupManager():
 if __name__ == "__main__":
 
 	start_time = time.time()
+	report_payload = {}
+	status = "Done"
+	errors = 0
 
 	cmd = argparse.ArgumentParser()
 	# cloud
@@ -444,24 +450,46 @@ if __name__ == "__main__":
 		cloud = BIMcloudAPI(**vars(arg))
 		drive = GoogleDriveAPI(arg.cred_path, arg.client)
 		notion = NotionAPI(arg.cred_path)
+		errors = 0
 		if cloud and drive:
 			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
 			backup = manager.backup(arg.resource)
 
-			status = 'Done' if manager.report['errors'] == 0 else 'Errors'
+			if manager.report.get('errors', 0) > 0:
+				status = "Error"
+		else:
+			errors += 1
+			status = "Fail"
 
 	except Exception as e:
 		logger.error(f"Unexpected error: {e}", exc_info=True)
-		manager.report['errors'] += 1
-		status = 'Failure'
-		sys.exit(1)
+		errors += 1
+		status = 'Fail'
 	finally:
-		notion.send_report(
-			data = {
-				'items': manager.report['backups'],
-				'time': round(manager.report['endtime'] - start_time),
-				'errors': manager.report['errors'],
+
+		print (manager.report)
+		if manager is not None:
+			report_payload = {
+				'items': manager.report.get('backups', 0),
+				'time': round(time.time() - start_time),
+				'errors': manager.report.get('errors', errors),
 				'status': status,
 			}
-		)
+		else:
+			report_payload = {
+				'items': 0,
+				'time': round(time.time() - start_time),
+				'errors': errors,
+				'status': status,
+			}
+
+		notion.send_report(data=report_payload)
+
 		logger.info(f"Finished in {round(time.time()-start_time)} sec")
+
+# TpL-[ArM]A-[C08b]024a-ZZ-M3
+# BGT-P00-000-AC-ZZ
+
+
+# C371A0D8-EDD9-4367-9FF9-B9CE75FA0E6C
+# 9C0BF882-923B-4315-9426-469D23110A2F

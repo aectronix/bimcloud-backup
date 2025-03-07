@@ -93,6 +93,7 @@ class NotionAPI():
 			raise RuntimeError("Notion authorization failed") from e
 
 	def send_report(self, data):
+		self.log.info(f"Sending report...")
 		query = {
 			'parent': { 'database_id': None},
 			'properties': {
