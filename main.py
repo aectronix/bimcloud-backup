@@ -4,8 +4,48 @@ import math
 import sys
 import time
 
-from datetime import date, datetime, timedelta
-from src import *
+from src import BIMcloudAPI, GoogleDriveAPI, NotionAPI
+
+
+def setup(arg):
+	"""
+	Configure global settings (i.e. logging, etc).
+
+	Args:
+		arg: An object with configuration attributes, e.g., arg.filepath.
+	"""
+	logger = logging.getLogger('BackupManager')
+	logger.setLevel(logging.DEBUG)
+	formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%d.%M.%y %H:%M:%S')
+
+	handler_console = LogHandler(logging.StreamHandler(sys.stdout))
+	handler_console.setFormatter(formatter)
+	handler_console.setLevel(logging.INFO)
+
+	handler_file = logging.FileHandler(arg.filepath, mode='a')
+	handler_file.setFormatter(formatter)
+	handler_file.setLevel(logging.WARNING)
+
+	logger.addHandler(handler_console)
+	logger.addHandler(handler_file)
+
+class LogHandler(logging.StreamHandler):
+	"""
+	Custom log handler that supports inline updates using carriage returns.
+	When a log message ends with '<rf>', it will update the same line.
+	"""
+	def emit(self, record):
+		try:
+			msg = self.format(record)
+			# If the message ends with the special marker, update inline.
+			if msg.endswith('<rf>'):
+				msg = msg.replace('<rf>', '')
+				sys.stdout.write(f"\r{msg.ljust(120)}\r")
+				sys.stdout.flush()
+			else:
+				sys.stdout.write(f"{msg}\n")
+		except Exception:
+			self.handleError(record)
 
 class BackupManager():
 
@@ -16,12 +56,11 @@ class BackupManager():
 		Args:
 			client: BIMcloud API client instance.
 			storage: Google Drive API instance.
-			**kwargs: Additional parameters, e.g., schedule_enabled.
+			**kwargs: Additional parameters
 		"""
 		self.log = logging.getLogger('BackupManager')
 		self.client = client
 		self.storage = storage
-		self.schedule_enabled = kwargs.get('schedule_enabled')
 
 		self.report = {
 			'backups': 0,
@@ -83,7 +122,7 @@ class BackupManager():
 			return
 
 		self.log.info(f"Found resources: {len(resources)}, starting backup process...")
-		i, b = 0, 0
+		i, backups_created = 0, 0
 		for resource in resources:
 			i += 1
 			self.log.info(f"Resource #{i}:")
@@ -91,14 +130,15 @@ class BackupManager():
 			timeout = self.get_timeout_from_filesize(resource['$size'])
 			
 			# remove all schedules if required
-			if self.schedule_enabled == 'n':
-				_ = self.delete_resource_schedules(resource['id'])
+			_ = self.delete_resource_schedules(resource['id'])
+
 			# check backups
 			has_outdated_backup = True
 			backups = self.client.get_resource_backups([resource['id']], params={'sort-by': '$time', 'sort-direction': 'desc'}) or []
 			if 	(backups and backups[0].get('$time') >= resource.get('$modifiedDate')) or \
 				(not backups and resource.get('$modifiedDate') == resource.get('$uploadedTime')): # special for libs
 				has_outdated_backup = False
+
 			# create new, remove old
 			if has_outdated_backup:
 				start_time = time.time()
@@ -122,19 +162,16 @@ class BackupManager():
 				if backup_new:
 					self.log.info(f"Backup successfully created.")
 					self.transfer_backup(resource, backup_new['id'])
-					b += 1
+					backups_created += 1
 			else:
 				self.log.info(f"Resource has valid backup, skipped")
+
 			# don't hurry up
 			time.sleep(1)
-
 			del resource
 
-		self.report['backups'] = b
+		self.report['backups'] = backups_created
 		self.report['endtime'] = time.time()
-
-	# def get_report(self):
-	# 	return self.report
 
 	def get_resources(self, ids: str):
 		"""	Retrieves resources from bimcloud storage. """
@@ -312,7 +349,7 @@ class BackupManager():
 				return schedule_delete_r
 			return None
 
-	def get_backup_data(self, resource_id, backup_id, timeout=300):
+	def get_backup_data(self, resource_id: str, backup_id: str, timeout: int = 300) -> bytes | None:
 		"""
 		Retrieve backup data from BIMcloud by streaming the response.
 
@@ -325,9 +362,7 @@ class BackupManager():
 			bytes: The downloaded backup data, or None if timed out.
 		"""
 		response = self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True)
-		total_length = response.headers.get('content-length')
-		if total_length is not None:
-			total_length = int(total_length)
+		total_length = int(response.headers.get('content-length', 0))
 		content = None
 		downloaded = 0
 		chunks = []
@@ -359,7 +394,7 @@ class BackupManager():
 
 		return content
 
-	def transfer_backup(self, resource, backup_id):
+	def transfer_backup(self, resource: dict, backup_id: str):
 		"""
 		Retrieve backup data from BIMcloud and upload it to Google Drive.
 
@@ -393,14 +428,12 @@ class BackupManager():
 		if upload:
 			self.log.info(f"Successfully uploaded to the cloud. ({upload['id']})")
 
-		del data
+		del data # just for case, considering large files
 
 
 if __name__ == "__main__":
 
 	start_time = time.time()
-	report_payload = {}
-	status = "Done"
 	errors = 0
 
 	cmd = argparse.ArgumentParser()
@@ -409,87 +442,43 @@ if __name__ == "__main__":
 	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
 	cmd.add_argument('-u', '--user', required=True, help='User Login')
 	cmd.add_argument('-p', '--password', required=True, help='User Password')
-	cmd.add_argument('-s', '--schedule_enabled', choices=['y', 'n'], default='n', help='Enable default schedules')
 	cmd.add_argument('-f', '--filepath', required=False, help='Path to the log file')
 	cmd.add_argument('-r', '--resource', required=False, help='Resource Id')
 	# drive
 	cmd.add_argument('-k', '--cred_path', required=True, help='Path to Gogole credentials')
+	# notion
+	cmd.add_argument('-n', '--notion', required=False, choices=['y', 'n'], default='y', help='Enable Notion reporting')
 	arg = cmd.parse_args()
 
-	class LogHandler(logging.StreamHandler):
-		""" Custom log handler to overwrite some output methods. """
-		def emit(self, record):
-			try:
-				msg = self.format(record)
-				if msg.endswith('<rf>'):
-					msg = msg.replace('<rf>', '')
-					sys.stdout.write(f"\r{msg}".ljust(120) + '\r')
-					sys.stdout.flush()
-				else:
-					sys.stdout.write(f"{msg}\n")
-			except Exception:
-				self.handleError(record)
+	setup(arg)
 
-	logger = logging.getLogger('BackupManager')
-	logger.setLevel(logging.DEBUG)
-	formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%d.%M.%y %H:%M:%S')
-
-	handler_console = LogHandler(logging.StreamHandler(sys.stdout))
-	handler_console.setFormatter(formatter)
-	handler_console.setLevel(logging.INFO)
-
-	handler_file = LogHandler
-	handler_file = logging.FileHandler(arg.filepath, mode='a')
-	handler_file.setFormatter(formatter)
-	handler_file.setLevel(logging.WARNING)
-
-	logger.addHandler(handler_console)
-	logger.addHandler(handler_file)
+	cloud = BIMcloudAPI(**vars(arg))
+	drive = GoogleDriveAPI(arg.cred_path, arg.client)
+	notion = NotionAPI(arg.cred_path)
+	manager = None
 
 	try:
-		cloud = BIMcloudAPI(**vars(arg))
-		drive = GoogleDriveAPI(arg.cred_path, arg.client)
-		notion = NotionAPI(arg.cred_path)
-		errors = 0
 		if cloud and drive:
-			manager = BackupManager(cloud, drive, schedule_enabled = arg.schedule_enabled)
-			backup = manager.backup(arg.resource)
-
-			if manager.report.get('errors', 0) > 0:
-				status = "Error"
+			manager = BackupManager(cloud, drive)
+			manager.backup(arg.resource)
+			status = "Done" if manager.report.get('errors', 0) == 0 else "Error"
 		else:
 			errors += 1
 			status = "Fail"
 
 	except Exception as e:
-		logger.error(f"Unexpected error: {e}", exc_info=True)
+		logging.getLogger('BackupManager').error(f"Unexpected error: {e}", exc_info=True)
 		errors += 1
 		status = 'Fail'
+
 	finally:
-
-		print (manager.report)
-		if manager is not None:
-			report_payload = {
-				'items': manager.report.get('backups', 0),
-				'time': round(time.time() - start_time),
-				'errors': manager.report.get('errors', errors),
-				'status': status,
-			}
-		else:
-			report_payload = {
-				'items': 0,
-				'time': round(time.time() - start_time),
-				'errors': errors,
-				'status': status,
-			}
-
-		notion.send_report(data=report_payload)
-
-		logger.info(f"Finished in {round(time.time()-start_time)} sec")
-
-# TpL-[ArM]A-[C08b]024a-ZZ-M3
-# BGT-P00-000-AC-ZZ
-
-
-# C371A0D8-EDD9-4367-9FF9-B9CE75FA0E6C
-# 9C0BF882-923B-4315-9426-469D23110A2F
+		stop_time = time.time()
+		report_payload = {
+			'items': manager.report.get('backups', 0) if manager else 0,
+			'time': round(stop_time - start_time),
+			'errors': manager.report.get('errors', errors) if manager else errors,
+			'status': status,
+		}
+		if notion and arg.notion != 'n':
+			notion.send_report(data=report_payload)
+		logging.getLogger('BackupManager').info(f"Finished in {round(stop_time-start_time)} sec")
