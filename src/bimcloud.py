@@ -20,6 +20,7 @@ class BIMcloudAPI():
 		"""
 		self.log = logging.getLogger("BackupManager")
 		self.manager = manager
+		self.version = None
 		self._client = client
 		self._user = user
 		self._password = password
@@ -38,7 +39,7 @@ class BIMcloudAPI():
 		"""
 		adapter = requests.adapters.HTTPAdapter(
 			max_retries=Retry(
-				total=3,
+				total=1,
 				backoff_factor=1,
 				status_forcelist=[429, 500, 502, 503, 504],
 				allowed_methods=['GET', 'POST', 'DELETE',]
@@ -126,13 +127,13 @@ class BIMcloudAPI():
 		try:
 			response = self.oauth2(self._user, self._password, self._client)
 			response.raise_for_status()
-			auth = response.json()
+			self._auth = response.json()
+			info = self.get_server_info()
+			self.version = info.get('registeredMajorVersion')
 			self.log.info(f"Connected to bimcloud on: {self.manager}")
 		except Exception as e:
 			self.log.error(f"Authentication error: {e}", exc_info=True)
 			raise RuntimeError("Authentication failed") from e
-
-		self._auth = auth
 
 	def refresh_on_expiration(self):
 		"""
@@ -198,7 +199,8 @@ class BIMcloudAPI():
 	def download_backup(self, resource_id, backup_id, timeout=300, stream=False):
 		""" Download a backup file from BIMcloud. """
 		url = self.manager + '/management/client/download-backup'
-		response = self._send_request('get', url, params={'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout, stream=stream)
+		# response = self._send_request('get', url, params={'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout, stream=stream)
+		response = requests.get(url, headers={'Authorization': f"Bearer {self._auth.get('access_token')}"}, params={'resource-id': resource_id, 'backup-id': backup_id}, timeout=timeout, stream=stream)
 		return response 
 
 	def get_resources_by_criterion(self, criterion=None, params=None):
@@ -223,6 +225,12 @@ class BIMcloudAPI():
 		""" Retrieve backup schedules based on a given criterion. """
 		url = self.manager + '/management/client/get-resource-backup-schedules-by-criterion'
 		response = self._send_request('post', url, json=criterion)
+		return response
+
+	def get_server_info(self):
+		url = self.manager + '/get-server-info'
+		response = self._send_request('get', url)
+		# response = requests.get(url, headers={'Authorization': f"Bearer {self._auth.get('access_token')}"})
 		return response
 
 	def insert_resource_backup_schedule(

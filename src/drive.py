@@ -24,6 +24,7 @@ class GoogleDriveAPI():
             'https://www.googleapis.com/auth/drive.file',
             'https://www.googleapis.com/auth/drive.metadata',
         ]
+        self.service_info = None
         self.service = None
 
         self.authorize(cred_path, account)
@@ -48,6 +49,7 @@ class GoogleDriveAPI():
             service = build('drive', 'v3', credentials=credentials)
             if service:
                 self.service = service
+                self.service_info = service_account_info['google_drive']
                 self.log.info(f"Cloud storage initialized: {service._baseUrl} ({account.split('@')[0]})")
         except Exception as e:
             raise RuntimeError("Google Drive authorization failed") from e
@@ -99,7 +101,7 @@ class GoogleDriveAPI():
             params['fileId'] = file_id
             request = self.service.files().update(**params)
         else:
-            params['body']['parents'] = ['1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0']
+            params['body']['parents'] = [self.service_info['target_id']]
             request = self.service.files().create(**params)
         return request
 

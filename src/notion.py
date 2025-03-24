@@ -26,7 +26,7 @@ class NotionAPI():
 				total=3,
 				backoff_factor=1,
 				status_forcelist=[429, 500, 502, 503, 504],
-				allowed_methods=['GET', 'POST', 'DELETE',]
+				allowed_methods=['GET', 'POST', 'DELETE', 'PATCH']
 			)
 		)
 		session = requests.Session()
@@ -93,9 +93,10 @@ class NotionAPI():
 			raise RuntimeError("Notion authorization failed") from e
 
 	def send_report(self, data):
-		self.log.info(f"Sending report...")
+		db_id = self.credentials.get('database')
+		dm_id = self.credentials.get('daemon')
 		query = {
-			'parent': { 'database_id': None},
+			'parent': { 'database_id': db_id},
 			'properties': {
 				'Name': {
 					'id': 'title',
@@ -115,7 +116,7 @@ class NotionAPI():
 						{
 							'type': 'text',
 							'text': {
-								'content': 'v25'
+								'content': 'v'+str(data.get('version'))
 							},
 							'annotations': {'bold': True}
 						}
@@ -124,26 +125,31 @@ class NotionAPI():
 				'Status': {
 					'type': 'status',
 					'status': {
-						# 'id': 'a96490cc-6128-483e-b171-1ad54127504b',
-						'name': data.get('status', None),
-						# 'color': 'green'
+						'name': data.get('status', None)
 					}
 				},
 				'Errors': {
 					'type': 'number',
 					'number': data.get('errors', None)
 				},
-				'Job Time': {
-					'type': 'number',
-					'number': data.get('time', None)
-				},
 				'Items': {
 					'type': 'number',
 					'number': data.get('items', None)
+				},
+				'Runtime': {
+					'type': 'number',
+					'number': data.get('time', None)
+				},
+				'Daemon': {
+					'type': 'relation',
+					'relation': [
+						{'id': dm_id}
+					]
 				}
 			}
 		}
-		request = self.add_page(query, '1acb695243cd8003af22cbacf66abc50')
+		response = self.add_page(query, db_id)
+		return response
 
 	def get_database(self, db_id):
 		url = 'https://api.notion.com/v1/databases/'+db_id+'/query'
@@ -155,4 +161,9 @@ class NotionAPI():
 			query['parent']['database_id'] = db_id
 		url = 'https://api.notion.com/v1/pages'
 		response = self._send_request('post', url, json=query)
+		return response
+
+	def get_page(self, page_id):
+		url = 'https://api.notion.com/v1/pages/'+page_id
+		response = self._send_request('get', url)
 		return response

@@ -1,33 +1,46 @@
 import argparse
 import logging
 import math
+import os
 import sys
 import time
 
 from src import BIMcloudAPI, GoogleDriveAPI, NotionAPI
 
-
 def setup(arg):
 	"""
 	Configure global settings (i.e. logging, etc).
 
-	Args:
-		arg: An object with configuration attributes, e.g., arg.filepath.
 	"""
 	logger = logging.getLogger('BackupManager')
 	logger.setLevel(logging.DEBUG)
 	formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%d.%M.%y %H:%M:%S')
 
-	handler_console = LogHandler(logging.StreamHandler(sys.stdout))
-	handler_console.setFormatter(formatter)
-	handler_console.setLevel(logging.INFO)
+	shell_log = LogHandler(logging.StreamHandler(sys.stdout))
+	shell_log.setFormatter(formatter)
+	shell_log.setLevel(logging.INFO)
+	logger.addHandler(shell_log)
 
-	handler_file = logging.FileHandler(arg.filepath, mode='a')
-	handler_file.setFormatter(formatter)
-	handler_file.setLevel(logging.WARNING)
+	root = os.path.dirname(os.path.abspath(__file__))
 
-	logger.addHandler(handler_console)
-	logger.addHandler(handler_file)
+	file_log_full = logging.FileHandler(os.path.join(root, "job_backup.log"), mode='w')
+	file_log_full.setFormatter(formatter)
+	file_log_full.setLevel(logging.INFO)
+	file_log_full.addFilter(NoProgressFilter())
+	logger.addHandler(file_log_full)
+
+	file_log_errors = logging.FileHandler(os.path.join(root, "job_errors.log"), mode='a')
+	file_log_errors.setFormatter(formatter)
+	file_log_errors.setLevel(logging.ERROR)
+	logger.addHandler(file_log_errors)
+
+ 	# initialize modules
+	cloud = BIMcloudAPI(**vars(arg))
+	drive = GoogleDriveAPI(arg.cred_path, arg.client)
+	notion = NotionAPI(arg.cred_path)
+	manager = None
+
+	return (logger, cloud, drive, notion, manager)
 
 class LogHandler(logging.StreamHandler):
 	"""
@@ -46,6 +59,15 @@ class LogHandler(logging.StreamHandler):
 				sys.stdout.write(f"{msg}\n")
 		except Exception:
 			self.handleError(record)
+
+class NoProgressFilter(logging.Filter):
+	"""
+	Custom class to filter out progression reports in console
+	"""
+	def filter(self, record):
+		return "<rf>" not in record.getMessage() or \
+					'100%' in record.getMessage() or \
+					'completed' in record.getMessage()
 
 class BackupManager():
 
@@ -142,7 +164,7 @@ class BackupManager():
 			# create new, remove old
 			if has_outdated_backup:
 				start_time = time.time()
-				backup_new = None
+				result, backup_new = None, None
 
 				if resource['type'] == 'project':
 					for bcp in backups:
@@ -151,24 +173,26 @@ class BackupManager():
 							self.log.info(f"Deleted: {len(backups)} backups, {delete_backup_r}")
 					project_create_r = self.create_project_backup(resource['id'])
 					result = self.run_with_timeout(self.is_project_backup_created, timeout, 1, project_create_r['id'])
-					backup_new = self.is_project_backup_valid(result, start_time)
+					if result:
+						backup_new = self.is_project_backup_valid(result, start_time)
 
 				if resource['type'] == 'library':
 					library_invoke_r = self.invoke_library_backup(resource['id'], start_time )
 					result = self.run_with_timeout(self.is_library_backup_created, timeout, 1, resource['id'], start_time)
 					schedule_delete_r = self.delete_resource_schedules(resource['id'])
-					backup_new = self.is_library_backup_valid(resource['id'], result['id'], start_time)
+					if result:
+						backup_new = self.is_library_backup_valid(resource['id'], result['id'], start_time)
 
 				if backup_new:
 					self.log.info(f"Backup successfully created.")
-					self.transfer_backup(resource, backup_new['id'])
-					backups_created += 1
+					upload = self.transfer_backup(resource, backup_new['id'])
+					if upload:
+						backups_created += 1
 			else:
 				self.log.info(f"Resource has valid backup, skipped")
 
 			# don't hurry up
 			time.sleep(1)
-			del resource
 
 		self.report['backups'] = backups_created
 		self.report['endtime'] = time.time()
@@ -221,7 +245,7 @@ class BackupManager():
 		)
 		if jobs and not isinstance(jobs, str):
 			job = jobs[0]
-			self.log.info(f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, (runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec)<rf>")
+			self.log.info(f"> {job['status']}: {job['progress']['current']}/{job['progress']['max']}, runtime: {round(kwargs.get('runtime'))}/{round(kwargs.get('timeout'))} sec<rf>")
 			if job['status'] in ['completed', 'failed']:
 				print ('', flush=True)
 				return job
@@ -349,7 +373,7 @@ class BackupManager():
 				return schedule_delete_r
 			return None
 
-	def get_backup_data(self, resource_id: str, backup_id: str, timeout: int = 300) -> bytes | None:
+	def get_backup_data(self, resource_id: str, backup_id: str, timeout: int = 300, max_retries: int = 1) -> bytes | None:
 		"""
 		Retrieve backup data from BIMcloud by streaming the response.
 
@@ -361,36 +385,42 @@ class BackupManager():
 		Returns:
 			bytes: The downloaded backup data, or None if timed out.
 		"""
-		response = self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True)
-		total_length = int(response.headers.get('content-length', 0))
 		content = None
-		downloaded = 0
-		chunks = []
-		start_time = time.time()
-		last = start_time
-		
-		if response.ok:
-			for chunk in response.iter_content(chunk_size=1024*64):
-				if chunk:
-					chunks.append(chunk)
-					downloaded += len(chunk)
-					now = time.time()
-					runtime = now - start_time
-					if runtime > timeout:
-						self.log.error("Error (timeout?) during download", exc_info=True)
-						self.report['errors'] += 1
-						return None
-					self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
-					last = now
+		retries = 0
 
-			content = b''.join(chunks)
-			self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
-			print ('', flush=True)
+		while not content and retries < max_retries:
+			try:
+				response = self.client.download_backup(resource_id, backup_id, timeout=timeout, stream=True)
+				total_length = int(response.headers.get('content-length', 0))
+				downloaded = 0
+				chunks = []
+				start_time = time.time()
+				last = start_time
+				
+				if response.ok:
+					for chunk in response.iter_content(chunk_size=1024*128): # 256 kb
+						if chunk:
+							chunks.append(chunk)
+							downloaded += len(chunk)
+							now = time.time()
+							runtime = now - start_time
+							if runtime > timeout:
+								self.log.error(f"Error (timeout?) during download ({resource_id})", exc_info=True)
+								self.report['errors'] += 1
+								return None
+							self.log.info(f"> receiving {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+							last = now
 
-		else:
-			self.log.error("Error during backup download", exc_info=True)
-			self.report['errors'] += 1
-			return None
+					content = b''.join(chunks)
+					self.log.info(f"> received {round(downloaded/total_length*100)}%, runtime: {round(runtime)}/{round(timeout)} sec<rf>")
+					print ('', flush=True)
+
+			except Exception as e:
+				self.log.error(f"Error during backup download: {e}, ({resource_id})", exc_info=True)
+				self.report['errors'] += 1
+				return None
+
+			retries += 1
 
 		return content
 
@@ -408,14 +438,14 @@ class BackupManager():
 			None
 		"""
 		self.log.info(f"Get contents and save to the cloud...")
-		timeout = self.get_timeout_from_filesize(resource['$size'], e=1.25) # adjusting for google
+		timeout = self.get_timeout_from_filesize(resource['$size'], e=1.30) # adjusting for google
 		data = self.get_backup_data(resource['id'], backup_id, timeout)
 		if not data:
-			logger.error(f"Failed to retreive backup data! Skipped.")
+			self.log.error(f"Failed to retreive backup data! Skipped. ({resource['id']})")
 			self.report['errors'] += 1
 			return None
 		files = self.storage.get_folder_resources('1XKPjCnJJUunDn67wMgcQUoYargTmrOJ0')
-		name = resource['name']+'.bim'+resource['type']+'25'
+		name = resource['name']+'.bim'+resource['type'] + str(self.client.version)
 		match_file = next((f for f in files if f['name'] == name), None)
 		match_file_id = match_file['id'] if match_file else None
 		request = self.storage.prepare_upload(
@@ -424,11 +454,13 @@ class BackupManager():
 			file_id = match_file_id,
 			resource_id = resource['id']
 		)
+		del data # just for case, considering large files
 		upload = self.run_with_timeout(self.storage.upload_chunks, timeout, 0.05, request)
 		if upload:
 			self.log.info(f"Successfully uploaded to the cloud. ({upload['id']})")
+			return True
 
-		del data # just for case, considering large files
+		return False
 
 
 if __name__ == "__main__":
@@ -442,20 +474,14 @@ if __name__ == "__main__":
 	cmd.add_argument('-c', '--client', required=True, help='Client Identification')
 	cmd.add_argument('-u', '--user', required=True, help='User Login')
 	cmd.add_argument('-p', '--password', required=True, help='User Password')
-	cmd.add_argument('-f', '--filepath', required=False, help='Path to the log file')
 	cmd.add_argument('-r', '--resource', required=False, help='Resource Id')
 	# drive
-	cmd.add_argument('-k', '--cred_path', required=True, help='Path to Gogole credentials')
+	cmd.add_argument('-k', '--cred_path', required=True, help='Path to credentials')
 	# notion
 	cmd.add_argument('-n', '--notion', required=False, choices=['y', 'n'], default='y', help='Enable Notion reporting')
 	arg = cmd.parse_args()
 
-	setup(arg)
-
-	cloud = BIMcloudAPI(**vars(arg))
-	drive = GoogleDriveAPI(arg.cred_path, arg.client)
-	notion = NotionAPI(arg.cred_path)
-	manager = None
+	log, cloud, drive, notion, manager = setup(arg)
 
 	try:
 		if cloud and drive:
@@ -467,7 +493,7 @@ if __name__ == "__main__":
 			status = "Fail"
 
 	except Exception as e:
-		logging.getLogger('BackupManager').error(f"Unexpected error: {e}", exc_info=True)
+		log.error(f"Unexpected error: {e}", exc_info=True)
 		errors += 1
 		status = 'Fail'
 
@@ -478,7 +504,9 @@ if __name__ == "__main__":
 			'time': round(stop_time - start_time),
 			'errors': manager.report.get('errors', errors) if manager else errors,
 			'status': status,
+			'version': cloud.version,
 		}
 		if notion and arg.notion != 'n':
-			notion.send_report(data=report_payload)
-		logging.getLogger('BackupManager').info(f"Finished in {round(stop_time-start_time)} sec")
+			logging.getLogger('BackupManager').info(f"Sending report...")
+			report = notion.send_report(data=report_payload)
+		log.info(f"Finished in {round(stop_time-start_time)} sec")
